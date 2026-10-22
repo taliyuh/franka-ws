@@ -1,0 +1,48 @@
+services:
+  franka_ros2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: franka_ros2
+    # Required/strongly recommended for Franka FCI
+    network_mode: host
+    ipc: host
+    privileged: true
+    environment:
+      DISPLAY: ${DISPLAY}
+      QT_X11_NO_MITSHM: "1"
+      # NVIDIA support
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      # ROS
+      ROS_DISTRO: humble
+      RCUTILS_COLORIZED_OUTPUT: "1"
+      # Workspace build defaults (Release, no libfranka tests); see the file.
+      COLCON_DEFAULTS_FILE: /franka_ws/colcon_defaults.yaml
+    volumes:
+      # Workspace root
+      - ../:/franka_ws
+      # X11 / RViz
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Hardware devices
+      - /dev:/dev:rw
+    devices:
+      - /dev/dri:/dev/dri
+    # Real-time capabilities for libfranka / ros2_control
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
+    ulimits:
+      rtprio:
+        soft: 99
+        hard: 99
+      rttime:
+        soft: -1
+        hard: -1
+      memlock:
+        soft: -1
+        hard: -1
+    stdin_open: true
+    tty: true
+    working_dir: /franka_ws
+    command: /bin/bash

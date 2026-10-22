@@ -1,0 +1,78 @@
+# Pipeline settings.
+#
+# `pipeline new` copies this file into the new session as <session>/config.yaml
+# and every later command reads THAT copy, so a session always records the
+# settings it was produced with. Edit this file to change the defaults for new
+# sessions; edit <session>/config.yaml to change one session.
+#
+# The workspace is the folder containing pipeline/ (found automatically).
+# Relative paths below are relative to the workspace; ~ is expanded.
+
+paths:
+  sessions: sessions                         # must be inside the workspace
+  # pose-refinement checkout with its .venv; default: next to the workspace.
+  # The environment variable PIPELINE_POSE_REFINEMENT overrides this.
+  pose_refinement: ../pose-refinement
+
+docker:
+  container: franka_ros2                     # see docker/compose.yaml
+  workspace: /franka_ws
+
+robot:
+  ip: 172.16.0.2
+  # Frames, PTP action and motion limits used by every capture tool.
+  config: src/calibration_claude/config/calibration_hardware.yaml
+  # Probe tool: pen-tip offset, approach height, descent limits.
+  manipulation_config: src/calibration_claude/config/board_manipulation.yaml
+
+holes: pipeline/config/holes.yaml
+
+# ---------------------------------------------------------------- eye in hand
+# Azure Kinect rigidly mounted on the wrist housing (fr3_link6, NOT joint 7).
+# The board itself is the calibration target.
+eye_in_hand:
+  camera: azure
+  namespace: /azure_camera
+  cameras_config: src/calibration_claude/config/cameras_azure.yaml
+  # Rough T_link6_camera used to plan the calibration views (from the
+  # AprilTag eye-in-hand solve of 2026-10-12). Needs to be within ~1 cm.
+  prior_handeye: pipeline/config/azure_prior_handeye.json
+  look_pose: pipeline/config/azure_look_pose.yaml
+  speed_scale: 0.3
+  # Multiplies the capture tool's wait for a fresh frame (10 s) and its motion
+  # timeouts; >1 tolerates a camera stream that stalls for a few seconds.
+  timeout_scale: 3.0
+  max_mad_px: 1.0            # reject board fits with a worse median rim residual
+  calibrate:
+    views: 30
+    bundle_free: [fx, fy, cx, cy]     # intrinsics refined by bundle adjustment
+    model: ["off", "scale", "sag"]    # chain error terms (quoted: YAML reads off as false), see eye_in_hand.chain_model
+  locate:
+    views: 8
+    max_view_spread_mm: 1.5           # views disagreeing more than this are dropped
+  plan:                               # view generation, see eye_in_hand.plan_views
+    min_dist: 0.40
+    max_dist: 0.62
+    max_tilt_deg: 35.0
+    max_roll_deg: 45.0                # camera roll about its axis, around the look pose roll
+    clearance: 0.125                  # link origins above the board top, m
+    limit_margin: 0.15                # rad from each joint limit
+    image_margin: 120.0               # px
+    max_step_deg: 45.0
+    box_deg: 35.0                     # confine joints 1-6 to +-this around the look pose (needed: wider gives unreachable views)
+    seed: 20261012
+
+# ----------------------------------------------------------------- stationary
+# Femto Mega + Femto Bolt fixed in the cell, ArUco tag on the gripper.
+stationary:
+  cameras:                    # name: topic namespace
+    mega: /mega_camera
+    bolt: /wrist_camera
+  reference_camera: mega
+  cameras_config: src/calibration_claude/config/cameras_mega_bolt.yaml
+  calibration_poses: pipeline/config/stationary_calibration_poses.txt
+  speed_scale: 0.2
+  # Accepted board-rig calibration (pose-refinement calibrate_stationary_rig.py),
+  # used with two cameras for its validated per-camera rim-bias terms.
+  # null fits without it.
+  rig_calibration: null

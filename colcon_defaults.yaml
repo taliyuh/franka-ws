@@ -1,0 +1,11 @@
+# Defaults for every `colcon build` in the franka_ros2 container, so a plain
+# `colcon build` works. docker/compose.yaml points COLCON_DEFAULTS_FILE here.
+#
+# BUILD_TESTS=OFF: libfranka's unit tests (and their ASan/UBSan variants) need
+# GoogleMock and are not needed to run the robot; this matches franka_ros2's
+# own README build command.
+build:
+  symlink-install: true
+  cmake-args:
+    - -DCMAKE_BUILD_TYPE=Release
+    - -DBUILD_TESTS=OFF

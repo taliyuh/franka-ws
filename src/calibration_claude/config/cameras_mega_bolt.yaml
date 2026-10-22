@@ -1,0 +1,10 @@
+# Both stationary cameras for one shared robot/ArUco taught-capture session.
+# The frame aliases are the stable names used by the host-side dual-handeye
+# stationary pipeline; the driver optical frame IDs are allowed to differ.
+cameras:
+  mega:
+    image_topic: /mega_camera/color/image_raw
+    camera_info_topic: /mega_camera/color/camera_info
+  bolt:
+    image_topic: /wrist_camera/color/image_raw
+    camera_info_topic: /wrist_camera/color/camera_info

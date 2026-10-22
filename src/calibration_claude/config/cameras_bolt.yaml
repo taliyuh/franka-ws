@@ -1,0 +1,6 @@
+# One stationary Femto Bolt used as the robot-calibrated reference camera.
+# The 4k_bolt launch file publishes these topics under /wrist_camera.
+cameras:
+  bolt:
+    image_topic: /wrist_camera/color/image_raw
+    camera_info_topic: /wrist_camera/color/camera_info

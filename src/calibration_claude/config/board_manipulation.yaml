@@ -1,0 +1,30 @@
+# Board-relative pen probing. All linear units are metres and radians are used
+# for rotations. The paper grid need not be configured: command its coordinates
+# directly through --offset X Y Z in the board frame.
+probe:
+  # Leave null so the approach pose is derived from the board plane. A fixed
+  # base-frame Z is accepted only if it leaves the physical pen tip at least
+  # approach_height_m above the board.
+  staging_z_m: null
+  # Clearance from the board plane for the approach pose.
+  approach_height_m: 0.15
+  # Fast, safe repositioning in X/Y at the current/safe staging height.
+  approach_speed_scale: 0.50
+  # Ten-times-faster descent profile: larger guarded steps avoid paying the
+  # controller's 2 s minimum trajectory duration for every millimetre.
+  descent_speed_scale: 0.60
+  descent_segment_m: 0.003
+  # Do not command below the requested pen-tip target plane. If the pen does
+  # not touch by this limit, remeasure pen_tip_offset_tcp_m rather than probing
+  # farther into the board.
+  max_descent_m: 0.15
+
+  # Orientation of fr3_hand_tcp relative to the board frame. This default makes
+  # TCP +Z point toward board -Z. Measure/update it for the actual pen mount.
+  tcp_orientation_board_rpy: [3.141592653589793, 0.0, 0.0]
+
+  # Vector from fr3_hand_tcp origin to the physical pen tip, expressed in TCP
+  # axes. The measured 12.5 cm pen is assumed coaxial with TCP +Z; in the
+  # downward pose TCP +Z points toward the board. This value is used to place
+  # the pen tip, not the TCP origin, on the requested board coordinate.
+  pen_tip_offset_tcp_m: [0.0, 0.0, 0.125]

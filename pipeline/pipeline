@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Entry point: runs board_pipeline with the pose-refinement interpreter
+# (Python 3.12 + the pinned numpy/scipy/OpenCV the refinement was validated on).
+#
+# Interpreter: $PIPELINE_PYTHON, else <pose_refinement>/.venv/bin/python, where
+# pose_refinement is $PIPELINE_POSE_REFINEMENT or paths.pose_refinement in
+# config/pipeline.yaml (relative to the workspace, ~ expanded).
+set -euo pipefail
+if [[ -f /.dockerenv ]]; then
+    echo "pipeline runs on the HOST, not in the container: it starts the ROS steps in" >&2
+    echo "the franka_ros2 container itself. In a host terminal, from the workspace, run:" >&2
+    echo "  ./pipeline/pipeline $*" >&2
+    exit 2
+fi
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+WORKSPACE="$(dirname "$HERE")"
+POSE_REFINEMENT="${PIPELINE_POSE_REFINEMENT:-$(sed -n 's/^ *pose_refinement: *\([^ #]*\).*/\1/p' "$HERE/config/pipeline.yaml" | head -1)}"
+POSE_REFINEMENT="${POSE_REFINEMENT/#\~/$HOME}"
+[[ "$POSE_REFINEMENT" == /* ]] || POSE_REFINEMENT="$WORKSPACE/$POSE_REFINEMENT"
+PY="${PIPELINE_PYTHON:-$POSE_REFINEMENT/.venv/bin/python}"
+if [[ ! -x "$PY" ]]; then
+    echo "no interpreter at $PY" >&2
+    echo "create the pose-refinement venv (see its requirements.txt), or set" >&2
+    echo "PIPELINE_POSE_REFINEMENT=/path/to/pose-refinement or PIPELINE_PYTHON=/path/to/python" >&2
+    exit 2
+fi
+PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -m board_pipeline "$@"

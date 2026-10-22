@@ -1,0 +1,35 @@
+# ------------------------------------------------------------------ colcon
+build/
+install/
+log/
+
+# ------------------------------------------------------------------- data
+# Pipeline sessions: 4K captures, fits, calibrations. Measurements, not code.
+sessions/
+
+# ------------------------------------------------------- upstream packages
+# Separate git checkouts with their own history. Commit local changes inside
+# each one (a fork branch), not here. Local changes at the time of writing:
+#   franka_ros2              PTP action-server watchdog, moveit.launch.py
+#                            activate_arm_controller, Gazebo calibration world
+#   azure_kinect_ros_driver  4K driver params, launch/4k_azure.launch.py
+#   OrbbecSDK_ROS2           launch/4k_bolt.launch.py, launch/4k_mega.launch.py
+src/azure_kinect_ros_driver/
+src/franka_description/
+src/franka_ros2/
+src/libfranka/
+src/olvx_descriptions_module/
+src/OrbbecSDK_ROS2/
+
+# ----------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --------------------------------------------------------------- IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

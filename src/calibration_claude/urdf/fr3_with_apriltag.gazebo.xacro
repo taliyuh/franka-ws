@@ -1,0 +1,68 @@
+<?xml version="1.0"?>
+<!--
+  FR3 for Gazebo with the hand-eye calibration AprilTag rigidly attached to the
+  gripper.
+
+  This wraps franka_gazebo_bringup's own xacro rather than replacing it: xacro
+  merges an included <robot>, and the <xacro:arg> declarations inside the
+  included file stay overridable from the command line, so every franka argument
+  (robot_type, hand, gazebo, ee_id, gazebo_effort, ...) still works exactly as it
+  does upstream.
+
+  The tag is a flat textured quad.  meshes/apriltag_36h11_id0.obj spans the black
+  square PLUS a one-cell white quiet zone, so the black square itself measures
+  106 mm - which is the number the calibration cares about.
+
+  The link carries a token 1 g mass: SDF conversion silently drops links whose
+  inertial is missing or zero, which would make the tag invisible in Gazebo.
+-->
+<robot name="fr3" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:include filename="$(find franka_gazebo_bringup)/urdf/franka_arm.gazebo.xacro"/>
+
+  <!-- Pose of the tag frame in fr3_hand_tcp. Keep in sync with
+       config/calibration.yaml tag.mount_xyz / tag.mount_rpy. -->
+  <xacro:arg name="tag_xyz" default="0.12 0 -0.05"/>
+  <xacro:arg name="tag_rpy" default="-1.5707963 0 -1.5707963"/>
+
+  <link name="calib_tag">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://calibration_claude/meshes/apriltag_36h11_id0.obj"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.001"/>
+      <inertia ixx="1e-7" ixy="0.0" ixz="0.0" iyy="1e-7" iyz="0.0" izz="1e-7"/>
+    </inertial>
+  </link>
+
+  <joint name="calib_tag_joint" type="fixed">
+    <parent link="fr3_hand_tcp"/>
+    <child link="calib_tag"/>
+    <origin xyz="$(arg tag_xyz)" rpy="$(arg tag_rpy)"/>
+  </joint>
+
+  <!-- The world has a single directional light with shadows off, so lean on the
+       diffuse/ambient response rather than specular highlights to keep the
+       black/white contrast the detector needs. -->
+  <gazebo reference="calib_tag">
+    <visual>
+      <material>
+        <ambient>0.9 0.9 0.9 1</ambient>
+        <diffuse>1.0 1.0 1.0 1</diffuse>
+        <specular>0.0 0.0 0.0 1</specular>
+        <pbr>
+          <metal>
+            <albedo_map>package://calibration_claude/meshes/apriltag_36h11_id0.png</albedo_map>
+            <metalness>0.0</metalness>
+            <roughness>1.0</roughness>
+          </metal>
+        </pbr>
+      </material>
+    </visual>
+  </gazebo>
+
+</robot>

@@ -1,0 +1,70 @@
+# joint_trajectory_controller for the FR3 arm.
+#
+# franka_gazebo_bringup/config/franka_gazebo_controllers.yaml has no trajectory
+# controller (only the example controllers), and that file belongs to
+# franka_ros2, so this one is handed to the spawner with `--param-file` instead:
+#
+#   ros2 run controller_manager spawner fr3_arm_controller \
+#       -t joint_trajectory_controller/JointTrajectoryController \
+#       -p <this file>
+#
+# P and D gains mirror franka_fr3_moveit_config/config/fr3_ros_controllers.yaml so
+# sim and the real robot behave the same.  FrankaGazeboHardwareInterface adds
+# gravity-compensation torques on top of whatever the controller commands.
+#
+# The one deliberate deviation from franka's config is the integral term, which is
+# zero there.  Franka's gravity model does not know about Gazebo's joint damping
+# and friction, so pure P/D leaves a standing error -- joint7, with the softest
+# gains, settles ~0.04 rad (2.4 deg) off target and holds there.  For calibration
+# that error is not fatal (the dataset records *measured* joints), but it moves the
+# tag away from where pose generation predicted it would be, so it is worth
+# removing.
+#
+# Effort is the only interface that actually actuates this hardware plugin:
+# gz_ros2_control's position path writes JointVelocityCmd, which
+# FrankaGazeboHardwareInterface's wrapped system never applies, so a
+# position-interface controller reports success while the arm does not move.
+fr3_arm_controller:
+  ros__parameters:
+    joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - position
+      - velocity
+    # Without explicit constraints a goal can hang forever: joint_trajectory_controller
+    # folds `stopped_velocity_tolerance` (default 0.01 rad/s) into the goal-state
+    # tolerance, and with `goal_time: 0.0` a goal that never meets it is never
+    # aborted either -- it just stays EXECUTING.  Under effort control joint7 holds a
+    # small steady-state error and jitters above that threshold, so the goal never
+    # terminates.  A non-zero goal_time makes an unreachable goal abort promptly
+    # instead; the capture node then checks the settled state itself.
+    constraints:
+      # Disabled on purpose. joint_trajectory_controller folds this into the goal
+      # state tolerance, and fr3_joint7's velocity state interface reports a
+      # constant ~2.93 rad/s in Gazebo while the joint is provably stationary
+      # (its position moves < 0.003 rad over 40 samples).  Any non-zero value here
+      # means a goal is never reported complete.  The capture node decides that a
+      # pose has been reached from position stability instead, which does not
+      # depend on the velocity interface at all.
+      stopped_velocity_tolerance: 0.0
+      goal_time: 3.0
+    gains:
+      fr3_joint1: {p: 600.0, d: 30.0, i: 20.0, i_clamp: 10.0}
+      fr3_joint2: {p: 600.0, d: 30.0, i: 20.0, i_clamp: 10.0}
+      fr3_joint3: {p: 600.0, d: 30.0, i: 20.0, i_clamp: 10.0}
+      fr3_joint4: {p: 600.0, d: 30.0, i: 20.0, i_clamp: 10.0}
+      fr3_joint5: {p: 250.0, d: 10.0, i: 10.0, i_clamp: 5.0}
+      fr3_joint6: {p: 150.0, d: 10.0, i: 10.0, i_clamp: 5.0}
+      # d: 0 -- see stopped_velocity_tolerance above. joint7's velocity state is
+      # stuck at ~2.93 rad/s, so a D term turns that into a constant ~15 Nm
+      # disturbance torque that the P term then has to fight, leaving the joint
+      # parked ~0.04 rad (2.4 deg) off target.
+      fr3_joint7: {p: 50.0, d: 0.0, i: 10.0, i_clamp: 5.0}

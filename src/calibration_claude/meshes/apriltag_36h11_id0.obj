@@ -1,0 +1,16 @@
+# AprilTag 36h11 id 0; black square = 106.0 mm,
+# quad including the 1-cell quiet zone = 132.5 mm.
+mtllib apriltag_36h11_id0.mtl
+o apriltag_36h11_id0
+v -0.066250 -0.066250 0.0
+v 0.066250 -0.066250 0.0
+v 0.066250 0.066250 0.0
+v -0.066250 0.066250 0.0
+vt 0.0 0.0
+vt 1.0 0.0
+vt 1.0 1.0
+vt 0.0 1.0
+vn 0.0 0.0 1.0
+usemtl apriltag_36h11_id0
+s off
+f 1/1/1 2/2/1 3/3/1 4/4/1

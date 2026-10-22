@@ -1,0 +1,6 @@
+# Azure Kinect 4K lossless BGRA stream for the manual hand-eye capture tool.
+# The driver publishes the raw image directly; no JPEG republisher is needed.
+cameras:
+  azure:
+    image_topic: /azure_camera/rgb/image_raw
+    camera_info_topic: /azure_camera/rgb/camera_info
