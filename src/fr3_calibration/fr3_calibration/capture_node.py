@@ -262,9 +262,7 @@ def run(session: CaptureSession, chain, poses, args) -> int:
     session.get_logger().info(f"waiting for {config['motion']['controller_action']}")
     if not driver.wait_for_controller():
         session.get_logger().error(
-            'no trajectory controller. In sim, launch '
-            'calibration_claude/sim_calibration.launch.py; on the real robot make '
-            'sure fr3_arm_controller is active.')
+            f"no {config['motion']['controller_action']}; is the robot launch running?")
         return 1
     if not driver.wait_for_state():
         session.get_logger().error('no /joint_states received')
@@ -438,7 +436,7 @@ def main(argv=None) -> int:
     parser.add_argument('--poses', type=int, default=None)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--reuse', default=None,
-                        help='replay a pose set previously written by preview_poses')
+                        help='joint poses to drive through (yaml with a poses list)')
     parser.add_argument('--dry-run', action='store_true',
                         help='move through the poses without capturing anything')
     parser.add_argument('--speed-scale', type=float, default=1.0,
@@ -481,14 +479,9 @@ def main(argv=None) -> int:
         urdf = session.wait_for_robot_description()
         if urdf:
             session.get_logger().info('using the live /robot_description')
-            if 'calib_tag' not in urdf:
-                session.get_logger().warn(
-                    'the live /robot_description has no calib_tag link -- something '
-                    'else is publishing it (a stale franka launch?), so the robot in '
-                    'Gazebo may not be carrying the tag')
         else:
             session.get_logger().warn(
-                'no /robot_description; falling back to the packaged xacro')
+                'no /robot_description; falling back to the FR3 xacro')
         chain = build_chain(config, urdf)
 
         if not args.dry_run:

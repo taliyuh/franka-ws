@@ -9,7 +9,7 @@ import yaml
 from .cameras import load_cameras
 from .kinematics import Chain
 
-PACKAGE = 'calibration_claude'
+PACKAGE = 'fr3_calibration'
 
 
 def share_directory() -> str:
@@ -37,12 +37,14 @@ def default_config_path(name: str) -> str:
 
 
 def load_config(path: str | None = None) -> dict:
-    with open(path or default_config_path('calibration.yaml'), 'r', encoding='utf-8') as f:
+    with open(path or default_config_path('calibration_hardware.yaml'), 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 
 def camera_config_path(path: str | None = None) -> str:
-    return path or default_config_path('cameras_sim.yaml')
+    if path is None:
+        raise ValueError('a cameras yaml is required (--cameras), e.g. config/cameras_azure.yaml')
+    return path
 
 
 def load_camera_set(path: str | None = None) -> dict:
@@ -57,7 +59,8 @@ def load_camera_specs(path: str | None = None) -> dict:
 
 
 def build_chain(config: dict, urdf_xml: str | None = None) -> Chain:
-    """Chain from a live ``/robot_description`` string, or by running xacro."""
+    """Chain from a live ``/robot_description`` string, or by running xacro on the
+    FR3 description (offline solves, or when no robot launch is running)."""
     robot = config['robot']
     kinematic_base_link = robot.get('kinematic_base_link', robot['base_link'])
     if urdf_xml:

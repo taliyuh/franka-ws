@@ -146,7 +146,7 @@ def cmd_probe(cfg: Config, args) -> None:
         ros.check_robot_ready(session.cfg)
         print("Enter approves the approach, Enter during the descent stops it, "
               "Enter again retracts. Keep the e-stop at hand.")
-    ros.ros2_run(session.cfg, "calibration_claude", "probe_board", *argv, interactive=not dry)
+    ros.ros2_run(session.cfg, "fr3_calibration", "probe_board", *argv, interactive=not dry)
     if dry:
         print(f"\nlooks right? `pipeline probe --hole {args.hole}` moves the arm")
 

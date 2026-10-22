@@ -16,9 +16,9 @@ remain static while those pairs arrive. The recorded inter-camera timestamps
 are retained as diagnostics, but they are not an acceptance gate.
 
 Examples:
-  ros2 run calibration_claude capture_stereo_rgbd
-  ros2 run calibration_claude capture_stereo_rgbd --output /franka_ws/captures/run_01
-  ros2 run calibration_claude capture_stereo_rgbd --camera left:/left_camera \\
+  ros2 run fr3_calibration capture_stereo_rgbd
+  ros2 run fr3_calibration capture_stereo_rgbd --output /franka_ws/captures/run_01
+  ros2 run fr3_calibration capture_stereo_rgbd --camera left:/left_camera \\
       --camera right:/right_camera
 """
 

@@ -94,7 +94,7 @@ approaches 15 cm above the hole, then descends in guarded steps:
 
 It never goes below the board surface. `--height MM` targets a point above
 the surface instead. Tool geometry (pen-tip offset, orientation) is in
-`src/calibration_claude/config/board_manipulation.yaml`.
+`src/fr3_calibration/config/board_manipulation.yaml`.
 
 For eye_in_hand, the board pose is corrected for the calibrated joint
 offsets at the chosen hole, because MoveIt plans with the nominal kinematics.
@@ -148,7 +148,7 @@ edit that copy; to change future sessions, edit the template.
 | `board_pipeline/cli.py` | commands |
 | `board_pipeline/session.py` | session folders, resumable step runner |
 | `board_pipeline/eye_in_hand.py` | Azure steps, chain model, view planner, hole correction |
-| `board_pipeline/stationary.py` | Mega/Bolt steps (wraps calibration_claude + pose-refinement) |
+| `board_pipeline/stationary.py` | Mega/Bolt steps (wraps fr3_calibration + pose-refinement) |
 | `board_pipeline/rimfit.py` | adapter to pose-refinement's rim fitter and bundle adjustment |
 | `board_pipeline/ros.py` | `docker exec` bridge, host/container path mapping |
 | `board_pipeline/fr3.py` | FR3 DH kinematics and IK |

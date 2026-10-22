@@ -1,6 +1,0 @@
-# One stationary Femto Mega used for the first end-to-end calibration run.
-# The topics are the defaults published by 4k_mega.launch.py.
-cameras:
-  mega:
-    image_topic: /mega_camera/color/image_raw
-    camera_info_topic: /mega_camera/color/camera_info

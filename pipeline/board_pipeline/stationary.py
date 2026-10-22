@@ -3,7 +3,7 @@
 calibrate: capture -> solve
     Taught capture of the tag on the gripper, then one hand-eye solve: a
     single-camera eye-to-hand solve, or a joint solve of both cameras with a
-    shared tag mount (calibration_claude solve_handeye / solve_joint_handeye).
+    shared tag mount (fr3_calibration solve_handeye / solve_joint_handeye).
 locate:    capture -> refine -> export
     One synchronized RGB-D frame per camera, the pose-refinement stationary
     rim fit, and the composition with the hand-eye into the robot base frame.
@@ -54,7 +54,7 @@ def make_steps(stage: str) -> list[Step]:
             args.append("--resume")
         ros.check_robot_ready(ctx.cfg)
         print("  attach the ArUco tag plate; the tool asks before every move")
-        ros.ros2_run(ctx.cfg, "calibration_claude", "run_taught_capture", *args,
+        ros.ros2_run(ctx.cfg, "fr3_calibration", "run_taught_capture", *args,
                      own=out, interactive=True)
 
     def calibration_solve(ctx: Context, out: Path) -> None:
@@ -63,14 +63,14 @@ def make_steps(stage: str) -> list[Step]:
         cameras = list(s["cameras"])
         result = out / CALIBRATION
         if len(cameras) == 1:
-            ros.ros2_run(ctx.cfg, "calibration_claude", "solve_handeye", capture,
+            ros.ros2_run(ctx.cfg, "fr3_calibration", "solve_handeye", capture,
                          "--camera", cameras[0], "--camera-frame", f"{cameras[0]}_camera",
                          "--config", _robot_config(ctx), "--output", _cp(ctx, result), own=out)
         else:
             args = [capture]
             for camera in cameras:
                 args += ["--camera", camera, "--camera-frame", f"{camera}={camera}_camera"]
-            ros.ros2_run(ctx.cfg, "calibration_claude", "solve_joint_handeye", *args,
+            ros.ros2_run(ctx.cfg, "fr3_calibration", "solve_joint_handeye", *args,
                          "--config", _robot_config(ctx), "--output", _cp(ctx, result), own=out)
         (ctx.session.path / CALIBRATION).write_bytes(result.read_bytes())
         print(f"  wrote {ctx.session.path / CALIBRATION}; inspect its quality section before use")
@@ -84,7 +84,7 @@ def make_steps(stage: str) -> list[Step]:
         for name, namespace in s["cameras"].items():
             args += ["--camera", f"{name}:{namespace}"]
         # The tool is interactive: one ENTER captures, "q" quits.
-        ros.ros2_run(ctx.cfg, "calibration_claude", "capture_stereo_rgbd", *args,
+        ros.ros2_run(ctx.cfg, "fr3_calibration", "capture_stereo_rgbd", *args,
                      own=out, stdin="\nq\n")
         if not list((out / "capture").glob("capture_*")):
             raise PipelineError("no frame was captured from every camera; are the cameras running?")

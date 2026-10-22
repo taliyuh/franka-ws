@@ -5,14 +5,14 @@ import unittest
 
 import numpy as np
 
-from calibration_claude.board_pose import (
+from fr3_calibration.board_pose import (
     board_target_pose,
     load_board_pose,
     signed_board_clearance,
     tip_position_in_base,
     validate_board_offset,
 )
-from calibration_claude.kinematics import (
+from fr3_calibration.kinematics import (
     conservative_joint_tolerances,
     make_transform,
     pose_error,

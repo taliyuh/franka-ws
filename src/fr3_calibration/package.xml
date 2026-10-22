@@ -1,13 +1,12 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>calibration_claude</name>
+  <name>fr3_calibration</name>
   <version>0.1.0</version>
   <description>
-    Hand-eye (eye-to-hand) calibration pose driver for the Franka FR3: generates
-    AprilTag-visibility-aware robot poses, drives the arm through them with a
-    joint trajectory controller, and captures the raw data needed to solve the
-    base-to-camera transforms offline.
+    Franka FR3 tools for the board pipeline: drives the arm through calibration
+    poses with the native PTP action and records camera frames + measured joints,
+    solves eye-to-hand calibrations, and probes board holes.
   </description>
   <maintainer email="bartlomiej.hryniewski@gmail.com">bartek</maintainer>
   <license>Apache-2.0</license>
@@ -27,15 +26,7 @@
   <exec_depend>tf2_ros</exec_depend>
 
   <exec_depend>xacro</exec_depend>
-  <exec_depend>robot_state_publisher</exec_depend>
-  <exec_depend>controller_manager</exec_depend>
-  <exec_depend>joint_trajectory_controller</exec_depend>
-  <exec_depend>joint_state_broadcaster</exec_depend>
-  <exec_depend>ros_gz_sim</exec_depend>
-  <exec_depend>ros_gz_bridge</exec_depend>
-  <exec_depend>ros_gz_image</exec_depend>
   <exec_depend>franka_description</exec_depend>
-  <exec_depend>franka_gazebo_bringup</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

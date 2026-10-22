@@ -21,9 +21,9 @@ docker:
 robot:
   ip: 172.16.0.2
   # Frames, PTP action and motion limits used by every capture tool.
-  config: src/calibration_claude/config/calibration_hardware.yaml
+  config: src/fr3_calibration/config/calibration_hardware.yaml
   # Probe tool: pen-tip offset, approach height, descent limits.
-  manipulation_config: src/calibration_claude/config/board_manipulation.yaml
+  manipulation_config: src/fr3_calibration/config/board_manipulation.yaml
 
 holes: pipeline/config/holes.yaml
 
@@ -33,7 +33,7 @@ holes: pipeline/config/holes.yaml
 eye_in_hand:
   camera: azure
   namespace: /azure_camera
-  cameras_config: src/calibration_claude/config/cameras_azure.yaml
+  cameras_config: src/fr3_calibration/config/cameras_azure.yaml
   # Rough T_link6_camera used to plan the calibration views (from the
   # AprilTag eye-in-hand solve of 2026-10-12). Needs to be within ~1 cm.
   prior_handeye: pipeline/config/azure_prior_handeye.json
@@ -69,7 +69,7 @@ stationary:
     mega: /mega_camera
     bolt: /wrist_camera
   reference_camera: mega
-  cameras_config: src/calibration_claude/config/cameras_mega_bolt.yaml
+  cameras_config: src/fr3_calibration/config/cameras_mega_bolt.yaml
   calibration_poses: pipeline/config/stationary_calibration_poses.txt
   speed_scale: 0.2
   # Accepted board-rig calibration (pose-refinement calibrate_stationary_rig.py),

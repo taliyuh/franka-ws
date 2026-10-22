@@ -2,19 +2,15 @@
 
 robot:
   base_link: base           # Match the live MoveIt planning frame.
-  # The calibration xacro is rooted at world; live base -> fr3_link0 is identity.
-  kinematic_base_link: world
   tip_link: fr3_hand_tcp
   joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4,
                 fr3_joint5, fr3_joint6, fr3_joint7]
-  # Used when /robot_description is not available (offline pose preview).
-  xacro: package://calibration_claude/urdf/fr3_with_apriltag.gazebo.xacro
+  # Used when /robot_description is not available (offline solves). Same
+  # kinematics as the live description published by the robot launch.
+  xacro: package://franka_description/robots/fr3/fr3.urdf.xacro
   xacro_mappings:
-    robot_type: fr3
     hand: 'true'
-    gazebo: 'true'
     ee_id: franka_hand
-    gazebo_effort: 'true'
 
 tag:
   family: 4x4_50

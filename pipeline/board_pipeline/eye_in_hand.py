@@ -283,7 +283,7 @@ def _settings(ctx: Context) -> dict:
 
 def _capture_tool(ctx: Context, poses: Path, out: Path) -> None:
     e = _settings(ctx)
-    ros.ros2_run(ctx.cfg, "calibration_claude", "run_calibration_capture",
+    ros.ros2_run(ctx.cfg, "fr3_calibration", "run_calibration_capture",
                  "--reuse", _cp(ctx, poses),
                  "--cameras", _cp(ctx, ctx.cfg.path(e["cameras_config"])),
                  "--config", _cp(ctx, ctx.cfg.path(ctx.cfg["robot"]["config"])),

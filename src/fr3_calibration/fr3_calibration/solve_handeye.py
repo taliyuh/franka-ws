@@ -27,10 +27,10 @@ try:  # Supports both ``python -m`` and direct execution during diagnosis.
     from .context import build_chain, load_config
     from .kinematics import Chain, axis_angle, make_transform, transform_from_xyz_rpy
 except ImportError:  # pragma: no cover - direct script invocation only
-    from calibration_claude import tag as tag_module
-    from calibration_claude.cameras import tag_corners
-    from calibration_claude.context import build_chain, load_config
-    from calibration_claude.kinematics import Chain, axis_angle, make_transform, transform_from_xyz_rpy
+    from fr3_calibration import tag as tag_module
+    from fr3_calibration.cameras import tag_corners
+    from fr3_calibration.context import build_chain, load_config
+    from fr3_calibration.kinematics import Chain, axis_angle, make_transform, transform_from_xyz_rpy
 
 
 MIN_SAMPLES = 4
