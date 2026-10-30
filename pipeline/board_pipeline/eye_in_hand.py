@@ -397,7 +397,7 @@ def make_steps(stage: str) -> list[Step]:
             _capture_tool(ctx, poses, out / "capture")
         except PipelineError:
             # The tool exits non-zero when any single pose fails (an unreachable
-            # view, a PTP stall); the views it did record are still good, and the
+            # view, a reflex that aborted a move); the views it did record are good, and the
             # fit step enforces the minimum number of usable views.
             recorded = out / "capture" / "poses.yaml"
             if not recorded.exists():
