@@ -402,8 +402,17 @@ class Chain:
             elif stalled > 12:
                 break
 
-        return q, bool(np.linalg.norm(pos_err) < position_tolerance
-                       and np.linalg.norm(rot_err) < rotation_tolerance)
+        converged = bool(np.linalg.norm(pos_err) < position_tolerance
+                         and np.linalg.norm(rot_err) < rotation_tolerance)
+        if not converged and nullspace_gain > 0.0:
+            # Near a target the posture bias can balance the remaining task
+            # error and stall the descent a few microns short (seen 0.107 mm
+            # against the 0.1 mm tolerance); finish without it from here.
+            return self.ik(target, q, max_iterations=max_iterations,
+                           position_tolerance=position_tolerance,
+                           rotation_tolerance=rotation_tolerance, damping=damping,
+                           nullspace_gain=0.0, limit_margin=limit_margin)
+        return q, converged
 
     def ik_with_restarts(self, target: np.ndarray, seed=None, *, attempts: int = 6,
                          rng=None, **kwargs):

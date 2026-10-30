@@ -142,7 +142,7 @@ class PinholeCamera:
 
     def apply_camera_info(self, msg) -> None:
         """Overwrite intrinsics from a live ``sensor_msgs/CameraInfo``."""
-        k = list(msg.k)
+        k = list(msg.K)
         self.fx, self.fy, self.cx, self.cy = k[0], k[4], k[2], k[5]
         self.width, self.height = int(msg.width), int(msg.height)
 
