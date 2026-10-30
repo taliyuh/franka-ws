@@ -1,9 +1,10 @@
 services:
-  franka_ros2:
+  franka_ros:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: franka_ros2
+    image: franka_ros:noetic
+    container_name: franka_ros
     # Required/strongly recommended for Franka FCI
     network_mode: host
     ipc: host
@@ -15,20 +16,20 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: all
       # ROS
-      ROS_DISTRO: humble
-      RCUTILS_COLORIZED_OUTPUT: "1"
-      # Workspace build defaults (Release, no libfranka tests); see the file.
+      ROS_DISTRO: noetic
+      ROSCONSOLE_STDOUT_LINE_BUFFERED: "1"
+      # Workspace build defaults (Release, which packages); see the file.
       COLCON_DEFAULTS_FILE: /franka_ws/colcon_defaults.yaml
     volumes:
       # Workspace root
       - ../:/franka_ws
       # X11 / RViz
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      # Hardware devices
+      # Hardware devices (Azure Kinect and Femto Bolt over USB)
       - /dev:/dev:rw
     devices:
       - /dev/dri:/dev/dri
-    # Real-time capabilities for libfranka / ros2_control
+    # Real-time capabilities for libfranka / franka_control (1 kHz loop)
     cap_add:
       - SYS_NICE
       - IPC_LOCK

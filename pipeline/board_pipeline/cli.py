@@ -146,7 +146,7 @@ def cmd_probe(cfg: Config, args) -> None:
         ros.check_robot_ready(session.cfg)
         print("Enter approves the approach, Enter during the descent stops it, "
               "Enter again retracts. Keep the e-stop at hand.")
-    ros.ros2_run(session.cfg, "fr3_calibration", "probe_board", *argv, interactive=not dry)
+    ros.rosrun(session.cfg, "panda_calibration", "probe_board", *argv, interactive=not dry)
     if dry:
         print(f"\nlooks right? `pipeline probe --hole {args.hole}` moves the arm")
 
@@ -155,7 +155,7 @@ def cmd_probe(cfg: Config, args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pipeline",
-        description="Camera calibration, board localisation and hole probing for the FR3.",
+        description="Camera calibration, board localisation and hole probing for the Franka Panda.",
         epilog="Run on the host. Typical run: new -> calibrate -> locate -> check -> probe "
                "(robot and cameras launched by hand in the container)")
     parser.add_argument("--session", help="session to use instead of the current one")

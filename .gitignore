@@ -8,18 +8,22 @@ log/
 sessions/
 
 # ------------------------------------------------------- upstream packages
-# Separate git checkouts with their own history. Commit local changes inside
-# each one (a fork branch), not here. Local changes at the time of writing:
-#   franka_ros2              PTP action-server watchdog, moveit.launch.py
-#                            activate_arm_controller, Gazebo calibration world
-#   azure_kinect_ros_driver  4K driver params, launch/4k_azure.launch.py
-#   OrbbecSDK_ROS2           launch/4k_bolt.launch.py, launch/4k_mega.launch.py
+# Panda / Noetic: franka_ros, panda_moveit_config, the Azure Kinect and Orbbec
+# ROS 1 drivers and libfranka 0.9.2 are built into the image (docker/Dockerfile);
+# the 4K camera settings are launch files in src/panda_calibration/launch.
+# The FR3 / ROS 2 setup kept separate git checkouts here; they stay ignored so
+# a workspace that still has them does not show them as untracked (colcon
+# skips them, see colcon_defaults.yaml).
 src/azure_kinect_ros_driver/
+src/Azure_Kinect_ROS_Driver/
 src/franka_description/
+src/franka_ros/
 src/franka_ros2/
 src/libfranka/
 src/olvx_descriptions_module/
+src/OrbbecSDK_ROS1/
 src/OrbbecSDK_ROS2/
+src/panda_moveit_config/
 
 # ----------------------------------------------------------------- Python
 __pycache__/

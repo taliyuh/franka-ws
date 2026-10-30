@@ -1,4 +1,4 @@
-"""Eye-in-hand setup: Azure Kinect rigid to fr3_link6, the board is the target.
+"""Eye-in-hand setup: Azure Kinect rigid to panda_link6, the board is the target.
 
 Chain model for view i of a static board:
 
@@ -34,7 +34,7 @@ import yaml
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
-from board_pipeline import fr3, rimfit, ros
+from board_pipeline import panda, rimfit, ros
 from board_pipeline.config import PIPELINE_DIR, PipelineError, load_yaml
 from board_pipeline.session import BOARD_POSE, CALIBRATION, Context, Step, sha256
 
@@ -66,7 +66,7 @@ def chain_model(terms):
             i += 1
         if "sag" in terms:
             c = v[i:i + 3]
-        return fr3.from_vec(v[:6]), fr3.from_vec(v[6:12]), dq, s, c
+        return panda.from_vec(v[:6]), panda.from_vec(v[6:12]), dq, s, c
 
     def predict(view, v):
         x, base_board, dq, s, c = unpack(v)
@@ -104,7 +104,7 @@ def scaled(cam_board, s):
 
 def camera_in_base(q, x, dq, sag):
     """T_base_camera for measured joints q under the chain model."""
-    link6 = fr3.fk(np.asarray(q) + dq, "fr3_link6")
+    link6 = panda.fk(np.asarray(q) + dq, "panda_link6")
     gravity = link6[:3, :3].T @ GRAVITY
     rotation = np.eye(4)
     rotation[:3, :3] = cv2.Rodrigues(np.asarray(sag * gravity, float))[0]
@@ -117,7 +117,12 @@ class Calibration:
     def __init__(self, data: dict):
         self.data = data
         self.x = np.asarray(data["T_link6_camera"])
-        self.dq = np.array([data["joint_offsets_rad"][n] for n in fr3.JOINT_NAMES])
+        offsets = data["joint_offsets_rad"]
+        if not set(panda.JOINT_NAMES) <= set(offsets):
+            raise PipelineError(
+                f"calibration was made for joints {sorted(offsets)}, not the Panda's; an FR3 "
+                "calibration does not transfer, run `pipeline calibrate`")
+        self.dq = np.array([offsets[n] for n in panda.JOINT_NAMES])
         self.scale = float(data["camera_translation_scale"])
         self.sag = np.asarray(data["mount_sag_rad_per_g"], float)
         self.intrinsics = np.array([data["intrinsics"][n] for n in rimfit.INTRINSIC_NAMES])
@@ -156,9 +161,9 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
     corners = np.array([[sx * BOARD_HALF[0], sy * BOARD_HALF[1], SURFACE_Z, 1]
                         for sx in (-1, 1) for sy in (-1, 1)])
     seeds = [q0]
-    look_x = (fr3.fk(q0, "fr3_link6") @ x)[:3, 0]
+    look_x = (panda.fk(q0, "panda_link6") @ x)[:3, 0]
 
-    lo, hi = fr3.LOWER + p.limit_margin, fr3.UPPER - p.limit_margin
+    lo, hi = panda.LOWER + p.limit_margin, panda.UPPER - p.limit_margin
     if p.box_deg is not None:
         m = math.radians(p.box_deg)
         lo[:6] = np.maximum(lo[:6], q0[:6] - m)
@@ -167,7 +172,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
     def ok_pose(q):
         if np.any(q < lo) or np.any(q > hi):
             return False
-        return fr3.frame_origins(q)[1:, 2].min() > table_z + p.clearance
+        return panda.frame_origins(q)[1:, 2].min() > table_z + p.clearance
 
     accepted = []
     for _ in range(4000):
@@ -196,7 +201,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
         target = cam @ np.linalg.inv(x)
         best = None
         for s in seeds:
-            q, err = fr3.ik_link6(target, s)
+            q, err = panda.ik_link6(target, s)
             if err < 1e-4 and ok_pose(q):
                 d = np.linalg.norm(q - s)
                 if best is None or d < best[1]:
@@ -204,7 +209,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
         if best is None:
             continue
         q = best[0]
-        cb = np.linalg.inv(fr3.fk(q, "fr3_link6") @ x) @ base_board @ corners.T
+        cb = np.linalg.inv(panda.fk(q, "panda_link6") @ x) @ base_board @ corners.T
         uv = (K @ (cb[:3] / cb[2])).T[:, :2]
         if np.any(uv < p.image_margin) or np.any(uv[:, 0] > width - p.image_margin) \
                 or np.any(uv[:, 1] > height - p.image_margin):
@@ -231,7 +236,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
     def segment_ok(qa, qb):
         if np.degrees(np.abs(qb - qa).max()) > p.max_step_deg:
             return False
-        return all(fr3.frame_origins(qa + s * (qb - qa))[1:, 2].min() > table_z + p.clearance
+        return all(panda.frame_origins(qa + s * (qb - qa))[1:, 2].min() > table_z + p.clearance
                    for s in np.linspace(0, 1, 60))
 
     order, current, left = [], q0, list(chosen)
@@ -250,7 +255,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
     for i in order:
         q = accepted[i][0]
         for s in np.linspace(0, 1, 60):
-            path_min = min(path_min, fr3.frame_origins(prev + s * (q - prev))[1:, 2].min() - table_z)
+            path_min = min(path_min, panda.frame_origins(prev + s * (q - prev))[1:, 2].min() - table_z)
         max_step = max(max_step, np.degrees(np.abs(q - prev).max()))
         prev = q
 
@@ -283,13 +288,13 @@ def _settings(ctx: Context) -> dict:
 
 def _capture_tool(ctx: Context, poses: Path, out: Path) -> None:
     e = _settings(ctx)
-    ros.ros2_run(ctx.cfg, "fr3_calibration", "run_calibration_capture",
-                 "--reuse", _cp(ctx, poses),
-                 "--cameras", _cp(ctx, ctx.cfg.path(e["cameras_config"])),
-                 "--config", _cp(ctx, ctx.cfg.path(ctx.cfg["robot"]["config"])),
-                 "--out", _cp(ctx, out), "--speed-scale", e["speed_scale"], "--no-detect",
-                 "--timeout-scale", e.get("timeout_scale", 1.0),
-                 own=out.parent, interactive=True)
+    ros.rosrun(ctx.cfg, "panda_calibration", "run_calibration_capture",
+               "--reuse", _cp(ctx, poses),
+               "--cameras", _cp(ctx, ctx.cfg.path(e["cameras_config"])),
+               "--config", _cp(ctx, ctx.cfg.path(ctx.cfg["robot"]["config"])),
+               "--out", _cp(ctx, out), "--speed-scale", e["speed_scale"], "--no-detect",
+               "--timeout-scale", e.get("timeout_scale", 1.0),
+               own=out.parent, interactive=True)
 
 
 def _calibration(ctx: Context) -> Calibration:
@@ -355,7 +360,7 @@ def make_steps(stage: str) -> list[Step]:
         q0 = np.asarray(json.loads((view / "joints.json").read_text())["measured_joints"])
         if calibrating:
             x = np.asarray(json.loads(ctx.cfg.path(_settings(ctx)["prior_handeye"]).read_text())["matrix"])
-            base_board = fr3.fk(q0, "fr3_link6") @ x @ T
+            base_board = panda.fk(q0, "panda_link6") @ x @ T
         else:
             base_board = _calibration(ctx).base_board(q0, T)
         (out / "seed.json").write_text(json.dumps({"T_base_board": base_board.tolist()}, indent=2))
@@ -378,7 +383,7 @@ def make_steps(stage: str) -> list[Step]:
         poses, report = plan_views(q0, base_board, x, rimfit.k_matrix(intr), info["width"],
                                    info["height"], e[stage]["views"], params)
         (out / "poses.yaml").write_text(yaml.safe_dump({
-            "joint_names": fr3.JOINT_NAMES,
+            "joint_names": panda.JOINT_NAMES,
             "poses": [{"joints": [round(float(v), 6) for v in q]} for q in poses]}))
         for line in report:
             print("  " + line)
@@ -414,7 +419,7 @@ def make_steps(stage: str) -> list[Step]:
             (ctx.step_dir(stage, "seed_fit") / "seed.json").read_text())["T_base_board"])
         if calibrating:
             x = np.asarray(json.loads(ctx.cfg.path(e["prior_handeye"]).read_text())["matrix"])
-            predict = lambda q: np.linalg.inv(fr3.fk(q, "fr3_link6") @ x) @ base_board  # noqa: E731
+            predict = lambda q: np.linalg.inv(panda.fk(q, "panda_link6") @ x) @ base_board  # noqa: E731
         else:
             cal = _calibration(ctx)
             predict = lambda q: cal.cam_board(q, base_board)  # noqa: E731
@@ -467,20 +472,20 @@ def make_steps(stage: str) -> list[Step]:
         prior = ctx.cfg.path(e["prior_handeye"])
         x_seed = np.asarray(json.loads(prior.read_text())["matrix"])
         n, fit_chain, error, unpack = chain_model(terms)
-        base0 = fr3.fk(views[0]["q"], "fr3_link6") @ x_seed @ views[0]["cam_board"]
+        base0 = panda.fk(views[0]["q"], "panda_link6") @ x_seed @ views[0]["cam_board"]
         print(f"  fitting {'+'.join(terms) or 'X only'} on {len(views)} views, then leave-one-out")
-        v = fit_chain(views, np.r_[fr3.to_vec(x_seed), fr3.to_vec(base0), np.zeros(n - 12)])
+        v = fit_chain(views, np.r_[panda.to_vec(x_seed), panda.to_vec(base0), np.zeros(n - 12)])
         loo = np.array([error(views[i], fit_chain(views[:i] + views[i + 1:], v)) for i in range(len(views))])
         fit_err = np.array([error(w, v) for w in views])
         x, base_board, dq, s, c = unpack(v)
         intr = json.loads((bundled / "intrinsics.json").read_text())
         calibration = {
             "setup": "eye_in_hand",
-            "parent_frame": "fr3_link6",
+            "parent_frame": "panda_link6",
             "child_frame": "rgb_camera_link",
             "model": list(terms),
             "T_link6_camera": x.tolist(),
-            "joint_offsets_rad": {name: float(dq[k]) for k, name in enumerate(fr3.JOINT_NAMES)},
+            "joint_offsets_rad": {name: float(dq[k]) for k, name in enumerate(panda.JOINT_NAMES)},
             "camera_translation_scale": float(s),
             "mount_sag_rad_per_g": np.asarray(c).tolist(),
             "intrinsics": dict(zip(intr["names"], intr["refined"])),
@@ -508,7 +513,7 @@ def make_steps(stage: str) -> list[Step]:
                   for w in views}
         values = np.array(list(spread.values()))
         board = {
-            "schema_version": 1, "units": "m", "base_frame": "base", "board_frame": "board",
+            "schema_version": 1, "units": "m", "base_frame": "panda_link0", "board_frame": "board",
             "board_surface_z_m": SURFACE_Z,
             "T_base_board": base_board.tolist(),
             "frame_note": ("true kinematic frame (calibrated joint offsets applied); "
@@ -553,7 +558,7 @@ def make_steps(stage: str) -> list[Step]:
             raise PipelineError(f"views disagree by more than {limit} mm; recalibrate or check overlays")
         values = np.array(list(spread.values()))
         board = {
-            "schema_version": 1, "units": "m", "base_frame": "base", "board_frame": "board",
+            "schema_version": 1, "units": "m", "base_frame": "panda_link0", "board_frame": "board",
             "board_surface_z_m": SURFACE_Z,
             "T_base_board": mean.tolist(),
             "frame_note": ("true kinematic frame (calibrated joint offsets applied); "
@@ -605,7 +610,7 @@ def corner_distance_mm(a, b):
 def hole_target(session, cfg, hole: dict, name: str) -> Path:
     """Board pose for probe_board, corrected for the joint offsets at this hole.
 
-    probe_board / MoveIt use the nominal FR3 kinematics, but the real arm sits
+    probe_board / MoveIt use the nominal Panda kinematics, but the real arm sits
     at FK(q + dq). For the tool pose over the hole we solve the true joint
     angles q_true, then express the board in the frame the nominal model
     believes in at that configuration:
@@ -631,15 +636,15 @@ def hole_target(session, cfg, hole: dict, name: str) -> Path:
     seed = np.asarray(json.loads(seed_joints.read_text())["measured_joints"])
     # A local IK from one seed can stall; try the look pose, READY, and both
     # with joint 7 turned, and keep the solution nearest the look pose.
-    seeds = [np.r_[base[:6], base[6] + turn] for base in (seed, fr3.READY)
+    seeds = [np.r_[base[:6], base[6] + turn] for base in (seed, panda.READY)
              for turn in (0.0, -math.pi / 2, math.pi / 2, -math.pi, math.pi)]
-    solutions = [fr3.ik(target, np.clip(s, fr3.LOWER, fr3.UPPER)) for s in seeds]
+    solutions = [panda.ik(target, np.clip(s, panda.LOWER, panda.UPPER)) for s in seeds]
     good = [q for q, r in solutions if r < 1e-4]
     q_true, residual = (min(good, key=lambda q: np.abs(q - seed).max()), 0.0) if good \
         else min(solutions, key=lambda t: t[1])
     if residual > 1e-4:
         raise PipelineError(f"no IK solution over {name} (residual {residual:.2e})")
-    correction = fr3.fk(q_true - cal.dq, "fr3_hand_tcp") @ np.linalg.inv(fr3.fk(q_true, "fr3_hand_tcp"))
+    correction = panda.fk(q_true - cal.dq, "panda_hand_tcp") @ np.linalg.inv(panda.fk(q_true, "panda_hand_tcp"))
     shift = (correction @ np.r_[tip[:3], 1])[:3] - tip[:3]
     print(f"joint-offset correction at {name}: tip shift {np.round(shift * 1e3, 2)} mm, "
           f"rotation {math.degrees(Rotation.from_matrix(correction[:3, :3]).magnitude()):.3f} deg")
@@ -647,7 +652,7 @@ def hole_target(session, cfg, hole: dict, name: str) -> Path:
     out = session.path / "targets" / f"{name}.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps({
-        "schema_version": 1, "units": "m", "base_frame": "base", "board_frame": "board",
+        "schema_version": 1, "units": "m", "base_frame": "panda_link0", "board_frame": "board",
         "board_surface_z_m": SURFACE_Z,
         "T_base_board": (correction @ board).tolist(),
         "source": {"setup": "eye_in_hand", "hole": name,

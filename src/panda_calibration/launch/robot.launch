@@ -6,7 +6,8 @@
 
   franka_control (libfranka 0.9.2) + franka_state_controller, the joint
   *position* trajectory controller every pipeline motion is sent to, and
-  MoveIt's move_group for /compute_ik (panda_moveit_config franka_control.launch).
+  MoveIt's move_group for /compute_ik (panda_moveit_config, as its
+  franka_control.launch would start it).
   moveit:=false skips move_group; the tools then use their local numeric IK.
 
   The arm must be unlocked, FCI activated in Desk, and the end effector in Desk
@@ -22,24 +23,23 @@
        franka_control's default is 30 Hz. -->
   <arg name="state_rate" default="250" />
 
-  <group if="$(arg moveit)">
-    <include file="$(find panda_moveit_config)/launch/franka_control.launch">
-      <arg name="robot_ip" value="$(arg robot_ip)" />
-      <arg name="load_gripper" value="$(arg load_gripper)" />
-      <arg name="transmission" value="position" />
-      <arg name="use_rviz" value="$(arg use_rviz)" />
-    </include>
-  </group>
+  <include file="$(find franka_control)/launch/franka_control.launch">
+    <arg name="robot_ip" value="$(arg robot_ip)" />
+    <arg name="load_gripper" value="$(arg load_gripper)" />
+  </include>
+  <!-- default_controllers.yaml (loaded by franka_control.launch) defines it. -->
+  <node name="position_trajectory_spawner" pkg="controller_manager" type="spawner"
+        respawn="false" output="screen" args="position_joint_trajectory_controller" />
 
-  <group unless="$(arg moveit)">
-    <include file="$(find franka_control)/launch/franka_control.launch">
-      <arg name="robot_ip" value="$(arg robot_ip)" />
-      <arg name="load_gripper" value="$(arg load_gripper)" />
-    </include>
-    <!-- default_controllers.yaml (loaded by franka_control.launch) defines it -->
-    <node name="position_trajectory_spawner" pkg="controller_manager" type="spawner"
-          respawn="false" output="screen" args="position_joint_trajectory_controller" />
-  </group>
+  <!-- move_group as panda_moveit_config's franka_control.launch starts it, but
+       with RViz optional (that launch file always opens it). -->
+  <include if="$(arg moveit)" file="$(find panda_moveit_config)/launch/demo.launch">
+    <arg name="load_robot_description" value="false" />
+    <arg name="moveit_controller_manager" value="simple" />
+    <arg name="transmission" value="position" />
+    <arg name="load_gripper" value="$(arg load_gripper)" />
+    <arg name="use_rviz" value="$(arg use_rviz)" />
+  </include>
 
   <!-- Overrides the value franka_control.launch loads (the later definition wins). -->
   <param name="franka_state_controller/publish_rate" value="$(arg state_rate)" />

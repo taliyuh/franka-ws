@@ -1,6 +1,8 @@
 # Joint pose the arm moves to before taking the seed RGB-D view (eye_in_hand).
-# The board must be fully visible from here. Taken from the 2026-10-12 session.
-joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+# The board must be fully visible from here. Taken from the 2026-10-12 FR3
+# session; inside the Panda's joint limits too (same kinematics), but check the
+# view on the Panda cell and replace it (`pipeline locate --here` helps).
+joint_names: [panda_joint1, panda_joint2, panda_joint3, panda_joint4, panda_joint5, panda_joint6, panda_joint7]
 poses:
 - joints:
   - 0.115298

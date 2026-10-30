@@ -1,1 +1,1 @@
-"""Robot-camera calibration, board localisation and hole probing for the FR3."""
+"""Robot-camera calibration, board localisation and hole probing for the Franka Panda."""

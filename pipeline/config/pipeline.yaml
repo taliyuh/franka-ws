@@ -15,27 +15,30 @@ paths:
   pose_refinement: ../pose-refinement
 
 docker:
-  container: franka_ros2                     # see docker/compose.yaml
+  container: franka_ros                      # see docker/compose.yaml
   workspace: /franka_ws
 
 robot:
   ip: 172.16.0.2
-  # Frames, PTP action and motion limits used by every capture tool.
-  config: src/fr3_calibration/config/calibration_hardware.yaml
+  # Frames, trajectory action and motion limits used by every capture tool.
+  config: src/panda_calibration/config/calibration_hardware.yaml
   # Probe tool: pen-tip offset, approach height, descent limits.
-  manipulation_config: src/fr3_calibration/config/board_manipulation.yaml
+  manipulation_config: src/panda_calibration/config/board_manipulation.yaml
 
 holes: pipeline/config/holes.yaml
 
 # ---------------------------------------------------------------- eye in hand
-# Azure Kinect rigidly mounted on the wrist housing (fr3_link6, NOT joint 7).
-# The board itself is the calibration target.
+# Azure Kinect rigidly mounted on the wrist housing (panda_link6, NOT joint 7).
+# The board itself is the calibration target. Launch the camera with
+# `roslaunch panda_calibration azure_4k.launch`.
 eye_in_hand:
   camera: azure
   namespace: /azure_camera
-  cameras_config: src/fr3_calibration/config/cameras_azure.yaml
+  cameras_config: src/panda_calibration/config/cameras_azure.yaml
   # Rough T_link6_camera used to plan the calibration views (from the
-  # AprilTag eye-in-hand solve of 2026-10-12). Needs to be within ~1 cm.
+  # AprilTag eye-in-hand solve of 2026-10-12 on the FR3; link6 is the same
+  # frame on the Panda, so it holds if the camera bracket is mounted the same
+  # way). Needs to be within ~1 cm.
   prior_handeye: pipeline/config/azure_prior_handeye.json
   look_pose: pipeline/config/azure_look_pose.yaml
   speed_scale: 0.3
@@ -63,13 +66,14 @@ eye_in_hand:
     seed: 20261012
 
 # ----------------------------------------------------------------- stationary
-# Femto Mega + Femto Bolt fixed in the cell, ArUco tag on the gripper.
+# Femto Mega + Femto Bolt fixed in the cell, ArUco tag on the gripper. Launch
+# the cameras with `roslaunch panda_calibration orbbec_4k.launch`.
 stationary:
   cameras:                    # name: topic namespace
     mega: /mega_camera
     bolt: /wrist_camera
   reference_camera: mega
-  cameras_config: src/fr3_calibration/config/cameras_mega_bolt.yaml
+  cameras_config: src/panda_calibration/config/cameras_mega_bolt.yaml
   calibration_poses: pipeline/config/stationary_calibration_poses.txt
   speed_scale: 0.2
   # Accepted board-rig calibration (pose-refinement calibrate_stationary_rig.py),

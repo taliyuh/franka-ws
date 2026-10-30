@@ -1,5 +1,5 @@
 {
-  "parent_frame": "fr3_link6",
+  "parent_frame": "panda_link6",
   "child_frame": "rgb_camera_link",
   "matrix": [
     [

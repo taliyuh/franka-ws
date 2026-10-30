@@ -1,11 +1,14 @@
-# Defaults for every `colcon build` in the franka_ros2 container, so a plain
-# `colcon build` works. docker/compose.yaml points COLCON_DEFAULTS_FILE here.
+# Defaults for every `colcon build` in the franka_ros (Noetic) container, so a
+# plain `colcon build` works. docker/compose.yaml points COLCON_DEFAULTS_FILE here.
 #
-# BUILD_TESTS=OFF: libfranka's unit tests (and their ASan/UBSan variants) need
-# GoogleMock and are not needed to run the robot; this matches franka_ros2's
-# own README build command.
+# franka_ros, panda_moveit_config and the camera drivers are built into the
+# image (/opt/franka_underlay); the workspace only builds the packages listed
+# in base-paths. Listing them, instead of all of src/, keeps colcon away from
+# the ROS 2 checkouts of the FR3 setup (franka_ros2, libfranka 0.20, ...) that
+# may still sit in src/ and do not build on Noetic. Add new packages here.
 build:
+  base-paths:
+    - src/panda_calibration
   symlink-install: true
   cmake-args:
     - -DCMAKE_BUILD_TYPE=Release
-    - -DBUILD_TESTS=OFF

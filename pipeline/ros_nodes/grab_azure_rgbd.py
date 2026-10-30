@@ -7,15 +7,16 @@ Run while the robot is stationary.
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+import rospy
 from sensor_msgs.msg import CameraInfo, Image, JointState
+
+JOINT_NAMES = [f'panda_joint{i}' for i in range(1, 8)]
 
 
 def to_array(msg):
@@ -33,29 +34,31 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('out', type=Path)
     p.add_argument('--ns', default='/azure_camera')
+    p.add_argument('--joints', default='/franka_state_controller/joint_states')
     p.add_argument('--timeout', type=float, default=15.0)
-    a = p.parse_args()
+    a = p.parse_args(rospy.myargv(sys.argv)[1:])
 
-    rclpy.init()
-    node = Node('grab_azure_rgbd')
+    rospy.init_node('grab_azure_rgbd', anonymous=True, disable_signals=True)
     start = time.time()
     got = {}
 
     def keep(key):
         def cb(msg):
-            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9 if hasattr(msg, 'header') else 0
-            if key in ('color', 'depth') and stamp < start + 0.5:
+            if key in ('color', 'depth') and msg.header.stamp.to_sec() < start + 0.5:
                 return  # only frames exposed after we started (robot already stationary)
+            if key == 'joints' and not set(JOINT_NAMES) <= set(msg.name):
+                return
             got[key] = msg
         return cb
 
-    node.create_subscription(Image, f'{a.ns}/rgb/image_raw', keep('color'), qos_profile_sensor_data)
-    node.create_subscription(Image, f'{a.ns}/depth_to_rgb/image_raw', keep('depth'), qos_profile_sensor_data)
-    node.create_subscription(CameraInfo, f'{a.ns}/rgb/camera_info', keep('info'), qos_profile_sensor_data)
-    node.create_subscription(JointState, '/franka_robot_state_broadcaster/measured_joint_states',
-                             keep('joints'), qos_profile_sensor_data)
+    # buff_size: a 4K BGRA frame is ~33 MB; the default buffer would drop it.
+    rospy.Subscriber(f'{a.ns}/rgb/image_raw', Image, keep('color'), queue_size=1, buff_size=2 ** 27)
+    rospy.Subscriber(f'{a.ns}/depth_to_rgb/image_raw', Image, keep('depth'), queue_size=1,
+                     buff_size=2 ** 26)
+    rospy.Subscriber(f'{a.ns}/rgb/camera_info', CameraInfo, keep('info'), queue_size=1)
+    rospy.Subscriber(a.joints, JointState, keep('joints'), queue_size=1)
     while len(got) < 4 and time.time() - start < a.timeout:
-        rclpy.spin_once(node, timeout_sec=0.1)
+        time.sleep(0.05)
     missing = {'color', 'depth', 'info', 'joints'} - set(got)
     if missing:
         raise SystemExit(f'timed out waiting for {sorted(missing)}')
@@ -69,18 +72,17 @@ def main():
     info = got['info']
     (a.out / 'camera_info.json').write_text(json.dumps({
         'width': info.width, 'height': info.height, 'distortion_model': info.distortion_model,
-        'd': list(info.d), 'k': list(info.k), 'r': list(info.r), 'p': list(info.p),
+        'd': list(info.D), 'k': list(info.K), 'r': list(info.R), 'p': list(info.P),
         'frame_id': info.header.frame_id}, indent=2))
     j = got['joints']
     pos = dict(zip(j.name, j.position))
     (a.out / 'joints.json').write_text(json.dumps({
-        'joint_names': [f'fr3_joint{i}' for i in range(1, 8)],
-        'measured_joints': [pos[f'fr3_joint{i}'] for i in range(1, 8)],
-        'color_stamp_s': got['color'].header.stamp.sec + got['color'].header.stamp.nanosec * 1e-9,
+        'joint_names': JOINT_NAMES,
+        'measured_joints': [pos[name] for name in JOINT_NAMES],
+        'color_stamp_s': got['color'].header.stamp.to_sec(),
     }, indent=2))
     print(f'saved {a.out}')
-    node.destroy_node()
-    rclpy.shutdown()
+    rospy.signal_shutdown('done')
 
 
 if __name__ == '__main__':

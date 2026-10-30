@@ -1,7 +1,7 @@
-"""Run ROS 2 commands inside the franka_ros2 container.
+"""Run ROS (Noetic) commands inside the franka_ros container.
 
 The CLI itself runs on the host (it needs the pose-refinement Python 3.12
-stack); everything that talks to the robot or the cameras runs in the Humble
+stack); everything that talks to the robot or the cameras runs in the Noetic
 container through `docker exec`. The workspace is bind-mounted, so host paths
 under paths.workspace are translated to docker.workspace.
 
@@ -13,13 +13,20 @@ could not delete or overwrite a step's output on a rerun.
 from __future__ import annotations
 
 import os
-import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 from board_pipeline.config import Config, PipelineError
+
+
+# The image sources the franka_ros underlay on top of Noetic; the workspace
+# overlay is sourced last (see docker/Dockerfile).
+ROS_SETUP = ("source /opt/franka_underlay/install/setup.bash"
+             " && source {workspace}/install/setup.bash")
 
 
 def container_path(cfg: Config, path: Path) -> str:
@@ -60,7 +67,7 @@ def run(cfg: Config, argv: list[str], *, own: Path | None = None,
     """
     ensure_container(cfg)
     workspace = cfg["docker"]["workspace"]
-    inner = (f"source /opt/ros/humble/setup.bash && source {workspace}/install/setup.bash"
+    inner = (f"{ROS_SETUP.format(workspace=workspace)}"
              f" && exec {shlex.join(argv)}")
     command = ["docker", "exec"]
     if interactive and sys.stdin.isatty():
@@ -83,42 +90,58 @@ def output(cfg: Config, argv: list[str], timeout: float = 20.0) -> str:
     """Run argv in the container with ROS sourced and return its stdout."""
     ensure_container(cfg)
     workspace = cfg["docker"]["workspace"]
-    inner = (f"source /opt/ros/humble/setup.bash && source {workspace}/install/setup.bash"
+    inner = (f"{ROS_SETUP.format(workspace=workspace)}"
              f" && timeout {timeout:g} {shlex.join(argv)}")
     return subprocess.run(["docker", "exec", cfg["docker"]["container"], "bash", "-c", inner],
                           capture_output=True, text=True).stdout
 
 
-# Controllers that hold a libfranka control loop. While one is active, the
-# native PTP action every capture/probe tool uses fails with "Cannot perform
-# this operation while another control or read operation is running".
-# moveit.launch.py leaves fr3_arm_controller inactive unless activate_arm_controller:=true.
-MOTION_BLOCKING = ("fr3_arm_controller",)
+# The pipeline's motions all go to this controller (franka_ros'
+# default_controllers.yaml, started by panda_calibration robot.launch).
+MOTION_CONTROLLER = "position_joint_trajectory_controller"
+# Command controllers that claim the same joints; while one is running the
+# trajectory controller cannot be (franka_example_controllers' are all named
+# *_example_controller).
+MOTION_BLOCKING = ("effort_joint_trajectory_controller",)
+
+
+def _blocks_motion(name: str) -> bool:
+    return name in MOTION_BLOCKING or name.endswith("_example_controller")
+
+
+def controller_states(cfg: Config) -> dict:
+    """{controller name: state} from the controller_manager, empty if none answers."""
+    listing = output(cfg, ["rosservice", "call", "/controller_manager/list_controllers"])
+    try:
+        data = yaml.safe_load(listing) or {}
+    except yaml.YAMLError:
+        return {}
+    return {entry["name"]: entry["state"] for entry in data.get("controller") or []
+            if isinstance(entry, dict) and "name" in entry}
 
 
 def check_robot_ready(cfg: Config) -> None:
     """Refuse to start a motion step the robot launch cannot execute."""
-    listing = output(cfg, ["ros2", "control", "list_controllers"])
-    if "active" not in listing:
-        # A wedged ros2 CLI daemon ("!rclpy.ok()") makes every query come back
-        # empty; restart it once before concluding the robot is not running.
-        output(cfg, ["bash", "-c", "ros2 daemon stop; ros2 daemon start"])
-        listing = output(cfg, ["ros2", "control", "list_controllers"])
-    states = {}
-    for line in re.sub(r"\x1b\[[0-9;]*m", "", listing).splitlines():
-        fields = line.split()
-        if len(fields) >= 2:
-            states[fields[0].split("[")[0]] = fields[-1]   # "name[type] state" or "name type state"
+    states = controller_states(cfg)
     if not states:
         raise PipelineError("no controller_manager answered; is the robot launch running in the "
-                            "container (franka_fr3_moveit_config moveit.launch.py)?")
-    active = [name for name in MOTION_BLOCKING if states.get(name) == "active"]
-    if active:
+                            "container (roslaunch panda_calibration robot.launch robot_ip:=...)?")
+    blocking = [name for name, state in states.items() if state == "running" and _blocks_motion(name)]
+    if blocking:
         raise PipelineError(
-            f"{', '.join(active)} is active and holds the robot's control loop, so the PTP motions "
-            "would be rejected. Deactivate it (MoveIt keeps working for IK):\n"
-            f"  ros2 control set_controller_state {active[0]} inactive")
+            f"{', '.join(blocking)} is running and claims the arm joints, so the position "
+            f"trajectory controller cannot run. Switch controllers:\n"
+            f"  rosservice call /controller_manager/switch_controller "
+            f"\"{{start_controllers: [{MOTION_CONTROLLER}], stop_controllers: [{blocking[0]}], "
+            f"strictness: 2}}\"")
+    state = states.get(MOTION_CONTROLLER)
+    if state != "running":
+        start = (f"rosrun controller_manager spawner {MOTION_CONTROLLER}" if state is None else
+                 f"rosservice call /controller_manager/switch_controller "
+                 f"\"{{start_controllers: [{MOTION_CONTROLLER}], stop_controllers: [], strictness: 2}}\"")
+        raise PipelineError(f"{MOTION_CONTROLLER} is {state or 'not loaded'}; every pipeline motion "
+                            f"is sent to it. Start it with\n  {start}")
 
 
-def ros2_run(cfg: Config, package: str, executable: str, *args, **kwargs) -> None:
-    run(cfg, ["ros2", "run", package, executable, *map(str, args)], **kwargs)
+def rosrun(cfg: Config, package: str, executable: str, *args, **kwargs) -> None:
+    run(cfg, ["rosrun", package, executable, *map(str, args)], **kwargs)

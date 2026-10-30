@@ -1,7 +1,10 @@
-"""FR3 kinematics (DH), pose vectors and a small IK, independent of ROS.
+"""Franka Panda kinematics (DH), pose vectors and a small IK, independent of ROS.
 
-The DH model reproduces the URDF FK of the stored datasets exactly (checked in
-calibration_diagnostics/solve_eye_in_hand.py, where this was taken from).
+The Panda and the FR3 share these DH parameters (Franka's published table);
+only the joint limits differ. The model reproduces the URDF FK of
+franka_description's panda.urdf.xacro (hand:=true) to machine precision
+(checked against the Panda URDF in the container), and of the FR3 datasets it
+was taken from (calibration_diagnostics/solve_eye_in_hand.py).
 """
 
 from __future__ import annotations
@@ -16,10 +19,11 @@ from scipy.spatial.transform import Rotation
 A = [0, 0, 0, 0.0825, -0.0825, 0, 0.088]
 D = [0.333, 0, 0.316, 0, 0.384, 0, 0]
 ALPHA = [0, -math.pi / 2, math.pi / 2, math.pi / 2, -math.pi / 2, math.pi / 2, math.pi / 2]
-LOWER = np.array([-2.9007, -1.8361, -2.9007, -3.0770, -2.8763, 0.4398, -3.0508])
-UPPER = np.array([2.9007, 1.8361, 2.9007, -0.1169, 2.8763, 4.6216, 3.0508])
+# franka_description/robots/panda/joint_limits.yaml (Panda datasheet limits).
+LOWER = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+UPPER = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
 READY = np.array([0, -math.pi / 4, 0, -3 * math.pi / 4, 0, math.pi / 2, math.pi / 4])
-JOINT_NAMES = [f"fr3_joint{i}" for i in range(1, 8)]
+JOINT_NAMES = [f"panda_joint{i}" for i in range(1, 8)]
 
 
 def dh(a, d, alpha, theta):
@@ -29,11 +33,11 @@ def dh(a, d, alpha, theta):
 
 
 def fk(q, tip):
-    """FR3 FK from base to fr3_link6 or fr3_hand_tcp (franka_hand)."""
+    """Panda FK from panda_link0 to panda_link6 or panda_hand_tcp (Franka Hand)."""
     t = np.eye(4)
     for i in range(6):
         t = t @ dh(A[i], D[i], ALPHA[i], q[i])
-    if tip == "fr3_link6":
+    if tip == "panda_link6":
         return t
     t = t @ dh(A[6], D[6], ALPHA[6], q[6]) @ dh(0, 0.107, 0, 0) @ dh(0, 0, 0, -math.pi / 4)
     t[:, 3] = t @ np.array([0, 0, 0.1034, 1])
@@ -47,7 +51,7 @@ def frame_origins(q):
         t = t @ dh(A[i], D[i], ALPHA[i], q[i])
         out.append(t[:3, 3].copy())
     out.append((t @ dh(0, 0.107, 0, 0))[:3, 3])
-    out.append(fk(q, "fr3_hand_tcp")[:3, 3])
+    out.append(fk(q, "panda_hand_tcp")[:3, 3])
     return np.array(out)
 
 
@@ -62,7 +66,7 @@ def from_vec(v):
     return t
 
 
-def ik(target, seed, tip="fr3_hand_tcp"):
+def ik(target, seed, tip="panda_hand_tcp"):
     """Joint angles reaching `target` (4x4) from `seed`; returns (q, max residual)."""
     def err(q):
         t = fk(q, tip)
@@ -74,9 +78,9 @@ def ik(target, seed, tip="fr3_hand_tcp"):
 
 
 def ik_link6(target, seed):
-    """IK for fr3_link6 with joint 7 held at the seed (it does not move link6)."""
+    """IK for panda_link6 with joint 7 held at the seed (it does not move link6)."""
     def err(x):
-        t = fk(np.r_[x, seed[6]], "fr3_link6")
+        t = fk(np.r_[x, seed[6]], "panda_link6")
         rot = Rotation.from_matrix(target[:3, :3].T @ t[:3, :3]).as_rotvec()
         return np.r_[(t[:3, 3] - target[:3, 3]) * 10, rot]
     solution = least_squares(err, seed[:6], bounds=(LOWER[:6], UPPER[:6]))
