@@ -1,10 +1,11 @@
-"""Probe a board-relative point using Franka's native PTP motion action.
+"""Probe a board-relative point with the Panda.
 
 The board pose is deliberately an input artifact.  Calibration and board-pose
 refinement can run independently, then publish a JSON file with ``T_base_board``
-for this program to consume. Every approach and descent move is sent through
-``/action_server/ptp_motion``; a generic joint trajectory controller is not
-accepted for probing.
+for this program to consume. Every approach and descent move is sent to
+franka_ros' ``position_joint_trajectory_controller`` (libfranka joint position
+interface) as a single-point quintic; an effort-mode trajectory controller is
+not accepted for probing, because it settles with a load-dependent residual.
 """
 
 from __future__ import annotations
@@ -16,17 +17,14 @@ import time
 from collections.abc import Callable
 
 import numpy as np
-import rclpy
+import rospy
 import tf2_ros
 import yaml
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import MoveItErrorCodes
-from moveit_msgs.srv import GetPositionIK
-from rclpy.node import Node
-from rclpy.time import Time
-from std_msgs.msg import String
+from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
 
-from .capture_node import LATCHED
+from .capture_node import robot_description
 from .context import build_chain, default_config_path, load_config
 from .board_pose import (
     board_target_pose,
@@ -39,11 +37,11 @@ from .kinematics import (
     pose_error,
     quaternion_to_matrix,
 )
-from .trajectory_client import ArmDriver
+from .trajectory_client import ArmDriver, spin_once
 
 
-NATIVE_PTP_ACTION_TYPE = 'ptp_motion'
-NATIVE_PTP_ACTION = '/action_server/ptp_motion'
+PROBE_ACTION_TYPE = 'follow_joint_trajectory'
+PROBE_ACTION = '/position_joint_trajectory_controller/follow_joint_trajectory'
 
 
 def compensate_pose_for_measured_error(desired: np.ndarray,
@@ -57,117 +55,111 @@ def compensate_pose_for_measured_error(desired: np.ndarray,
 
 
 def validate_probe_motion_config(config: dict) -> None:
-    """Require the native Franka PTP action for real board probing.
+    """Require the joint *position* trajectory controller for real board probing.
 
-    A one-point FollowJointTrajectory goal can be accepted by a generic ROS 2
-    controller while still producing a discontinuous command at the libfranka
-    boundary. Board probing must therefore never silently fall back to that
-    controller.
+    franka_control also offers ``effort_joint_trajectory_controller``, whose PD
+    gains leave a load-dependent steady-state error far above the 0.1 mm probe
+    tolerance. Board probing must therefore never silently use it.
     """
     motion = config.get('motion')
     if not isinstance(motion, dict):
         raise ValueError('robot configuration is missing the motion section')
     action_type = motion.get('action_type')
     action_name = motion.get('controller_action')
-    if action_type != NATIVE_PTP_ACTION_TYPE or action_name != NATIVE_PTP_ACTION:
+    if action_type != PROBE_ACTION_TYPE or action_name != PROBE_ACTION:
         raise ValueError(
-            'probe_board requires native Franka PTP motion: '
-            f'action_type={NATIVE_PTP_ACTION_TYPE!r}, '
-            f'controller_action={NATIVE_PTP_ACTION!r}; '
+            'probe_board requires the joint position trajectory controller: '
+            f'action_type={PROBE_ACTION_TYPE!r}, '
+            f'controller_action={PROBE_ACTION!r}; '
             f'got action_type={action_type!r}, controller_action={action_name!r}')
 
 
-class BoardManipulation(Node):
+class BoardManipulation:
     def __init__(self, config: dict, args):
-        super().__init__('board_manipulation')
         validate_probe_motion_config(config)
         self.config = config
         self.args = args
         self.joint_names = config['robot']['joint_names']
-        self.driver = ArmDriver(self, self.joint_names, config['motion'])
-        self.ik_client = self.create_client(GetPositionIK, 'compute_ik')
+        self.driver = ArmDriver(self.joint_names, config['motion'])
+        self.ik_service = config['robot'].get('ik_service', '/compute_ik')
+        self.ik_client = rospy.ServiceProxy(self.ik_service, GetPositionIK)
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self,
-                                                      spin_thread=False)
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.local_chain = None
         self.kinematic_chain = None
         self.use_moveit_ik = False
-        self.robot_description = None
-        self.create_subscription(
-            String,
-            '/robot_description',
-            self._on_robot_description,
-            LATCHED,
-        )
 
-    def _on_robot_description(self, message):
-        self.robot_description = message.data
+    def shutdown(self) -> None:
+        self.driver.shutdown()
 
     def wait_for_robot_description(self, timeout=10.0):
-        deadline = time.monotonic() + timeout
-        while self.robot_description is None and time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-        return self.robot_description
+        return robot_description(timeout)
+
+    def ik_available(self, timeout: float) -> bool:
+        try:
+            rospy.wait_for_service(self.ik_service, timeout=timeout)
+            return True
+        except rospy.ROSException:
+            return False
 
     def wait_for_robot(self) -> bool:
         if not self.args.dry_run:
             motion_action = self.config['motion']['controller_action']
-            self.get_logger().info(f'waiting for native Franka PTP action {motion_action}')
+            rospy.loginfo(f'waiting for trajectory action {motion_action}')
             if not self.driver.wait_for_controller(timeout=10.0):
-                self.get_logger().error(
-                    f'native Franka PTP action {motion_action} is unavailable; '
-                    'start franka_bringup without fr3_arm_controller')
+                rospy.logerr(
+                    f'trajectory action {motion_action} is unavailable; start '
+                    'panda_calibration robot.launch (it runs position_joint_trajectory_controller)')
                 return False
 
-        self.get_logger().info('waiting for /joint_states')
+        rospy.loginfo('waiting for /joint_states')
         if not self.driver.wait_for_state(timeout=10.0):
-            self.get_logger().error(
+            rospy.logerr(
                 'no /joint_states received; start the robot MoveIt stack first')
             return False
-        self.use_moveit_ik = self.ik_client.wait_for_service(timeout_sec=2.0)
+        self.use_moveit_ik = self.ik_available(2.0)
         urdf_xml = self.wait_for_robot_description()
         if urdf_xml:
-            self.get_logger().info(
+            rospy.loginfo(
                 'using live /robot_description for local TCP IK/FK')
             self.kinematic_chain = build_chain(self.config, urdf_xml)
         else:
-            self.get_logger().warning(
+            rospy.logwarn(
                 'live /robot_description unavailable; falling back to packaged '
                 'xacro for local TCP IK/FK')
             self.kinematic_chain = build_chain(self.config)
         if not self.use_moveit_ik:
-            self.get_logger().warn('MoveIt IK unavailable; using local FR3 IK')
+            rospy.logwarn('MoveIt IK unavailable; using local Panda IK')
             self.local_chain = self.kinematic_chain
-        self.get_logger().info('robot state and IK are ready')
+        frame_problem = self.driver.check_measured_tcp_frame(self.kinematic_chain)
+        if frame_problem:
+            if not self.args.dry_run:
+                rospy.logerr(frame_problem)
+                return False
+            rospy.logwarn(frame_problem)
+        rospy.loginfo('robot state and IK are ready')
         return True
 
-    def current_tcp_position(self, base_frame: str) -> np.ndarray:
-        """Return the live TCP position in *base_frame* from TF."""
+    def _lookup(self, base_frame: str):
         source_frame = self.args.ik_link
         deadline = time.monotonic() + 2.0
-        while rclpy.ok() and time.monotonic() < deadline:
-            if self.tf_buffer.can_transform(base_frame, source_frame, Time()):
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            if self.tf_buffer.can_transform(base_frame, source_frame, rospy.Time(0)):
                 break
-            rclpy.spin_once(self, timeout_sec=0.05)
+            spin_once(0.05)
         else:
             raise RuntimeError(
                 f'no TF transform from {base_frame!r} to {source_frame!r}')
-        transform = self.tf_buffer.lookup_transform(base_frame, source_frame, Time())
-        translation = transform.transform.translation
+        return self.tf_buffer.lookup_transform(base_frame, source_frame, rospy.Time(0))
+
+    def current_tcp_position(self, base_frame: str) -> np.ndarray:
+        """Return the live TCP position in *base_frame* from TF."""
+        translation = self._lookup(base_frame).transform.translation
         return np.array([translation.x, translation.y, translation.z], dtype=float)
 
     def current_tcp_pose(self, base_frame: str) -> np.ndarray:
         """Return the latest live TCP pose in *base_frame* from TF."""
-        source_frame = self.args.ik_link
-        deadline = time.monotonic() + 2.0
-        while rclpy.ok() and time.monotonic() < deadline:
-            if self.tf_buffer.can_transform(base_frame, source_frame, Time()):
-                break
-            rclpy.spin_once(self, timeout_sec=0.05)
-        else:
-            raise RuntimeError(
-                f'no TF transform from {base_frame!r} to {source_frame!r}')
-        transform = self.tf_buffer.lookup_transform(base_frame, source_frame, Time())
+        transform = self._lookup(base_frame)
         translation = transform.transform.translation
         rotation = transform.transform.rotation
         return make_transform(
@@ -188,8 +180,9 @@ class BoardManipulation(Node):
                 raise RuntimeError('local IK could not solve this pose')
             return [float(value) for value in joints]
 
-        request = GetPositionIK.Request()
+        request = GetPositionIKRequest()
         request.ik_request.group_name = self.args.move_group
+        request.ik_request.timeout = rospy.Duration(0.5)
         request.ik_request.ik_link_name = self.args.ik_link
         request.ik_request.avoid_collisions = True
         current_positions = self.driver.positions
@@ -205,11 +198,10 @@ class BoardManipulation(Node):
         target.position.x, target.position.y, target.position.z = pose[:3, 3]
         target.orientation.x, target.orientation.y, target.orientation.z, target.orientation.w = \
             matrix_to_quaternion(pose[:3, :3])
-        future = self.ik_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
-        if not future.done():
-            raise RuntimeError('timed out waiting for MoveIt IK')
-        response = future.result()
+        try:
+            response = self.ik_client(request)
+        except rospy.ServiceException as error:
+            raise RuntimeError(f'MoveIt IK call failed: {error}') from error
         if response.error_code.val != MoveItErrorCodes.SUCCESS:
             raise RuntimeError(f'MoveIt IK failed with error code {response.error_code.val}')
         positions = dict(zip(response.solution.joint_state.name,
@@ -242,7 +234,7 @@ class BoardManipulation(Node):
                 pose_validator(command_pose)
             joints = self.solve_ik(command_pose, frame_id)
             if self.args.dry_run:
-                self.get_logger().info(
+                rospy.loginfo(
                     f'dry-run IK: {np.array2string(np.asarray(joints), precision=4)}')
                 return
 
@@ -260,7 +252,7 @@ class BoardManipulation(Node):
             if actual_pose is None:
                 actual_pose = self.current_tcp_pose(frame_id)
             translation_error, rotation_error = pose_error(desired_pose, actual_pose)
-            self.get_logger().info(
+            rospy.loginfo(
                 f'achieved TCP error: {translation_error:.6f} m, '
                 f'{rotation_error:.6f} rad'
                 + (f' (correction {attempt}/{correction_attempts})'
@@ -269,7 +261,7 @@ class BoardManipulation(Node):
             if ok and (translation_error <= maximum_translation_error
                        and rotation_error <= maximum_rotation_error):
                 if message:
-                    self.get_logger().warn(message)
+                    rospy.logwarn(message)
                 return
 
             if not ok and 'settled Cartesian error is' not in message:
@@ -292,7 +284,7 @@ class BoardManipulation(Node):
                     f'(limit {maximum_rotation_error:.6f} rad)')
 
             command_pose = compensate_pose_for_measured_error(desired_pose, actual_pose)
-            self.get_logger().warn(
+            rospy.logwarn(
                 'measured TCP residual is within the correction window; '
                 'retrying with a compensated Cartesian command')
 
@@ -321,17 +313,18 @@ def main(argv=None) -> int:
     parser.add_argument(
         '--config',
         help=('robot calibration YAML; defaults to calibration_hardware.yaml, which '
-              'selects /action_server/ptp_motion'))
+              'selects position_joint_trajectory_controller'))
     parser.add_argument('--manipulation-config', help='board probing YAML')
-    parser.add_argument('--move-group', default='fr3_arm')
-    parser.add_argument('--ik-link', default='fr3_hand_tcp')
+    parser.add_argument('--move-group', default='panda_manipulator',
+                        help='MoveIt group whose tip is --ik-link (panda_moveit_config)')
+    parser.add_argument('--ik-link', default='panda_hand_tcp')
     parser.add_argument('--staging-z', type=float, default=None,
                         help='fixed TCP Z in the base frame for the XY phase')
     parser.add_argument('--dry-run', action='store_true',
                         help='validate artifact and IK without sending trajectories')
     parser.add_argument('--yes', action='store_true',
                         help='skip the approach confirmation (never skip physical e-stop checks)')
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv if argv is not None else rospy.myargv(sys.argv)[1:])
 
     try:
         base_frame, board_transform, surface_z = load_board_pose(args.board_pose)
@@ -367,11 +360,11 @@ def main(argv=None) -> int:
     print(f'pen-tip target in base [m]: {board_point[:3].tolist()}')
     print(f'TCP target in base [m]: {target[:3, 3].tolist()}')
     if args.dry_run:
-        print('Dry-run: no Franka PTP goals will be sent.')
+        print('Dry-run: no trajectory goals will be sent.')
     elif not args.yes:
         input('Press Enter to approach the point, or Ctrl-C to abort... ')
 
-    rclpy.init()
+    rospy.init_node('board_manipulation', anonymous=True, disable_signals=True)
     node = BoardManipulation(config, args)
     try:
         if not node.wait_for_robot():
@@ -419,7 +412,7 @@ def main(argv=None) -> int:
             raise RuntimeError('staging pose and target pose are indistinguishable')
         descent_direction = descent_vector / available_descent
         descent_limit = min(maximum, available_descent)
-        node.get_logger().info(
+        rospy.loginfo(
             f'phase 1: moving to board-relative approach pose '
             f'({staging_source}, pen-tip clearance '
             f'{staging_clearance * 1000:.1f} mm)')
@@ -433,7 +426,7 @@ def main(argv=None) -> int:
                 pose_validator=validate_pen_clearance)
             return 0
 
-        node.get_logger().info(
+        rospy.loginfo(
             f'phase 2: descending along the approach path at '
             f'{float(probe["descent_speed_scale"]):.3f} speed scale '
             f'(limit {descent_limit * 1000:.1f} mm)')
@@ -457,18 +450,18 @@ def main(argv=None) -> int:
                 float(probe['descent_speed_scale']),
                 pose_validator=validate_pen_clearance)
             descended += step
-            node.get_logger().info(f'descended {descended * 1000:.1f} mm')
+            rospy.loginfo(f'descended {descended * 1000:.1f} mm')
 
         if not stop_event.is_set():
-            node.get_logger().error('maximum descent reached without an operator stop')
-            node.get_logger().warn('retracting to the configured approach pose')
+            rospy.logerr('maximum descent reached without an operator stop')
+            rospy.logwarn('retracting to the configured approach pose')
             node.move_cartesian_pose(
                 staging,
                 base_frame,
                 float(probe['approach_speed_scale']),
                 pose_validator=validate_pen_clearance)
             return 1
-        node.get_logger().info(f'stopped after {descended * 1000:.1f} mm; holding position')
+        rospy.loginfo(f'stopped after {descended * 1000:.1f} mm; holding position')
         input('Press Enter to retract along the approach path, or Ctrl-C to hold... ')
         node.move_cartesian_pose(
             staging,
@@ -479,15 +472,14 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         return 130
     except RuntimeError as error:
-        if rclpy.ok():
-            node.get_logger().error(f'aborted: {error}')
+        if not rospy.is_shutdown():
+            rospy.logerr(f'aborted: {error}')
         else:
             print(f'aborted: {error}', file=sys.stderr)
         return 1
     finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        node.shutdown()
+        rospy.signal_shutdown('done')
 
 
 if __name__ == '__main__':

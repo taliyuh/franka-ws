@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Replay taught Cartesian poses (or --manual) and record tag views."""
+import sys
+
+from panda_calibration.taught_capture import main
+
+sys.exit(main())

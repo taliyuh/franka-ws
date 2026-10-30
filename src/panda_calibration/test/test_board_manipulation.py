@@ -5,14 +5,14 @@ import unittest
 
 import numpy as np
 
-from fr3_calibration.board_pose import (
+from panda_calibration.board_pose import (
     board_target_pose,
     load_board_pose,
     signed_board_clearance,
     tip_position_in_base,
     validate_board_offset,
 )
-from fr3_calibration.kinematics import (
+from panda_calibration.kinematics import (
     conservative_joint_tolerances,
     make_transform,
     pose_error,
@@ -23,7 +23,7 @@ from fr3_calibration.kinematics import (
 class BoardManipulationGeometryTest(unittest.TestCase):
     def test_load_board_pose_and_make_approach(self):
         artifact = {
-            'base_frame': 'fr3_link0',
+            'base_frame': 'panda_link0',
             'T_base_board': np.eye(4).tolist(),
             'board_surface_z_m': 0.025,
         }
@@ -35,7 +35,7 @@ class BoardManipulationGeometryTest(unittest.TestCase):
         target, approach = board_target_pose(
             transform, surface_z, np.array([0.05, -0.02, 0.0]), 0.15,
             [np.pi, 0.0, 0.0], np.zeros(3))
-        self.assertEqual(base_frame, 'fr3_link0')
+        self.assertEqual(base_frame, 'panda_link0')
         np.testing.assert_allclose(target[:3, 3], [0.05, -0.02, 0.025])
         np.testing.assert_allclose(approach[:3, 3], [0.05, -0.02, 0.175])
         np.testing.assert_allclose(target[:3, 2], [0.0, 0.0, -1.0], atol=1e-8)
@@ -57,7 +57,7 @@ class BoardManipulationGeometryTest(unittest.TestCase):
 
     def test_rejects_non_rigid_transform(self):
         artifact = {
-            'base_frame': 'fr3_link0',
+            'base_frame': 'panda_link0',
             'T_base_board': [[2, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
             'board_surface_z_m': 0.025,
         }

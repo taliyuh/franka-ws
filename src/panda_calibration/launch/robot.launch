@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!--
+  Panda (FER, system 4.2.x) bringup for the board pipeline.
+
+    roslaunch panda_calibration robot.launch robot_ip:=172.16.0.2
+
+  franka_control (libfranka 0.9.2) + franka_state_controller, the joint
+  *position* trajectory controller every pipeline motion is sent to, and
+  MoveIt's move_group for /compute_ik (panda_moveit_config franka_control.launch).
+  moveit:=false skips move_group; the tools then use their local numeric IK.
+
+  The arm must be unlocked, FCI activated in Desk, and the end effector in Desk
+  set to the Franka Hand (O_T_EE is then panda_hand_tcp; the tools check it).
+-->
+<launch>
+  <arg name="robot_ip" />
+  <arg name="load_gripper" default="true" />
+  <arg name="moveit" default="true" doc="start move_group for /compute_ik" />
+  <arg name="use_rviz" default="false" />
+  <!-- franka_state_controller rate: measured joints for settle detection and
+       image bracketing, and FrankaState (O_T_EE) for the Cartesian checks.
+       franka_control's default is 30 Hz. -->
+  <arg name="state_rate" default="250" />
+
+  <group if="$(arg moveit)">
+    <include file="$(find panda_moveit_config)/launch/franka_control.launch">
+      <arg name="robot_ip" value="$(arg robot_ip)" />
+      <arg name="load_gripper" value="$(arg load_gripper)" />
+      <arg name="transmission" value="position" />
+      <arg name="use_rviz" value="$(arg use_rviz)" />
+    </include>
+  </group>
+
+  <group unless="$(arg moveit)">
+    <include file="$(find franka_control)/launch/franka_control.launch">
+      <arg name="robot_ip" value="$(arg robot_ip)" />
+      <arg name="load_gripper" value="$(arg load_gripper)" />
+    </include>
+    <!-- default_controllers.yaml (loaded by franka_control.launch) defines it -->
+    <node name="position_trajectory_spawner" pkg="controller_manager" type="spawner"
+          respawn="false" output="screen" args="position_joint_trajectory_controller" />
+  </group>
+
+  <!-- Overrides the value franka_control.launch loads (the later definition wins). -->
+  <param name="franka_state_controller/publish_rate" value="$(arg state_rate)" />
+</launch>

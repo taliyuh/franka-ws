@@ -1,0 +1,65 @@
+<?xml version="1.0"?>
+<!--
+  Stationary Femto Mega + Femto Bolt, 4K colour with depth registered to colour.
+
+    roslaunch panda_calibration orbbec_4k.launch mega_serial:=... bolt_serial:=...
+
+  Topics (what cameras_mega_bolt.yaml and capture_stereo_rgbd expect):
+    /mega_camera/color/image_raw, /mega_camera/color/camera_info, /mega_camera/depth/image_raw
+    /wrist_camera/...  (the Bolt; the namespace name is historical)
+  bolt:=false or mega:=false starts one camera only (cameras_bolt.yaml).
+  The Mega is found over the network by default (enumerate_net_device); set
+  mega_ip to pin it.
+-->
+<launch>
+  <arg name="mega" default="true" />
+  <arg name="bolt" default="true" />
+  <arg name="mega_serial" default="" />
+  <arg name="bolt_serial" default="" />
+  <arg name="mega_ip" default="" />
+  <arg name="fps" default="15" />
+  <arg name="device_num" value="$(eval int(arg('mega')) + int(arg('bolt')))" />
+
+  <include if="$(arg mega)" file="$(find orbbec_camera)/launch/femto_mega.launch">
+    <arg name="camera_name" value="mega_camera" />
+    <arg name="serial_number" value="$(arg mega_serial)" />
+    <arg name="ip_address" value="$(arg mega_ip)" />
+    <arg name="port" value="$(eval 8090 if arg('mega_ip') else 0)" />
+    <arg name="enumerate_net_device" value="$(eval not arg('mega_ip'))" />
+    <arg name="device_num" value="$(arg device_num)" />
+    <arg name="color_width" value="3840" />
+    <arg name="color_height" value="2160" />
+    <arg name="color_fps" value="$(arg fps)" />
+    <arg name="color_format" value="MJPG" />
+    <arg name="depth_width" value="640" />
+    <arg name="depth_height" value="576" />
+    <arg name="depth_fps" value="$(arg fps)" />
+    <arg name="depth_format" value="Y16" />
+    <arg name="depth_registration" value="true" />
+    <arg name="align_mode" value="SW" />
+    <arg name="enable_ir" value="false" />
+    <arg name="enable_point_cloud" value="false" />
+    <arg name="enable_accel" value="false" />
+    <arg name="enable_gyro" value="false" />
+  </include>
+
+  <include if="$(arg bolt)" file="$(find orbbec_camera)/launch/femto_bolt.launch">
+    <arg name="camera_name" value="wrist_camera" />
+    <arg name="serial_number" value="$(arg bolt_serial)" />
+    <arg name="device_num" value="$(arg device_num)" />
+    <arg name="color_width" value="3840" />
+    <arg name="color_height" value="2160" />
+    <arg name="color_fps" value="$(arg fps)" />
+    <arg name="color_format" value="MJPG" />
+    <arg name="depth_width" value="640" />
+    <arg name="depth_height" value="576" />
+    <arg name="depth_fps" value="$(arg fps)" />
+    <arg name="depth_format" value="Y16" />
+    <arg name="depth_registration" value="true" />
+    <arg name="align_mode" value="SW" />
+    <arg name="enable_ir" value="false" />
+    <arg name="enable_point_cloud" value="false" />
+    <arg name="enable_accel" value="false" />
+    <arg name="enable_gyro" value="false" />
+  </include>
+</launch>

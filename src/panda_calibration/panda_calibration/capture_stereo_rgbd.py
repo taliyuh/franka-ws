@@ -9,16 +9,17 @@ intrinsics and timestamps required to interpret them later:
       mega/color.png, mega/depth.png, mega/camera_info.json, mega/meta.json
       bolt/color.png, bolt/depth.png, bolt/camera_info.json, bolt/meta.json
 
-The default topics match 4k_mega.launch.py and 4k_bolt.launch.py. The cameras
+The default topics match panda_calibration's orbbec_4k.launch (Mega under
+/mega_camera, Bolt under /wrist_camera, depth registered to colour). The cameras
 are not hardware synchronized, so this tool waits for one fresh,
 timestamp-compatible RGB-D pair from each camera independently. The board must
 remain static while those pairs arrive. The recorded inter-camera timestamps
 are retained as diagnostics, but they are not an acceptance gate.
 
 Examples:
-  ros2 run fr3_calibration capture_stereo_rgbd
-  ros2 run fr3_calibration capture_stereo_rgbd --output /franka_ws/captures/run_01
-  ros2 run fr3_calibration capture_stereo_rgbd --camera left:/left_camera \\
+  rosrun panda_calibration capture_stereo_rgbd
+  rosrun panda_calibration capture_stereo_rgbd --output /franka_ws/captures/run_01
+  rosrun panda_calibration capture_stereo_rgbd --camera left:/left_camera \\
       --camera right:/right_camera
 """
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import time
 from collections import deque
@@ -34,11 +36,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import rclpy
+import rospy
 from cv_bridge import CvBridge
-from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 
 
@@ -88,7 +87,7 @@ class CameraStream:
     # more than a second at the slow 5 Hz camera without retaining gigabytes.
     BUFFER_SIZE = 8
 
-    def __init__(self, node: Node, topics: CameraTopics):
+    def __init__(self, topics: CameraTopics):
         self.name = topics.name
         self.topics = topics
         self._bridge = CvBridge()
@@ -97,12 +96,13 @@ class CameraStream:
         self._depth: deque[ImageFrame] = deque(maxlen=self.BUFFER_SIZE)
         self._info: CameraInfo | None = None
 
-        node.create_subscription(Image, topics.color, self._color_callback,
-                                 qos_profile_sensor_data)
-        node.create_subscription(Image, topics.depth, self._depth_callback,
-                                 qos_profile_sensor_data)
-        node.create_subscription(CameraInfo, topics.info, self._info_callback,
-                                 qos_profile_sensor_data)
+        # rospy runs each subscription on its own thread. Large buffers keep
+        # a 4K frame from being split across reads and dropped.
+        rospy.Subscriber(topics.color, Image, self._color_callback,
+                         queue_size=2, buff_size=2 ** 27)
+        rospy.Subscriber(topics.depth, Image, self._depth_callback,
+                         queue_size=2, buff_size=2 ** 26)
+        rospy.Subscriber(topics.info, CameraInfo, self._info_callback, queue_size=1)
 
     def _color_callback(self, message: Image) -> None:
         try:
@@ -152,7 +152,7 @@ def image_frame(image: np.ndarray, message: Image) -> ImageFrame:
     stamp = message.header.stamp
     return ImageFrame(
         image=image,
-        ros_stamp_s=stamp.sec + stamp.nanosec * 1e-9,
+        ros_stamp_s=stamp.secs + stamp.nsecs * 1e-9,
         received_at_s=time.monotonic(),
         encoding=message.encoding,
     )
@@ -175,10 +175,10 @@ def camera_info_dict(info: CameraInfo) -> dict[str, object]:
         "width": info.width,
         "height": info.height,
         "distortion_model": info.distortion_model,
-        "d": list(info.d),
-        "k": list(info.k),
-        "r": list(info.r),
-        "p": list(info.p),
+        "d": list(info.D),
+        "k": list(info.K),
+        "r": list(info.R),
+        "p": list(info.P),
         "binning_x": info.binning_x,
         "binning_y": info.binning_y,
     }
@@ -264,14 +264,6 @@ def wait_for_captures(streams: list[CameraStream], timeout_s: float,
     return None
 
 
-def spin_until_shutdown(executor: MultiThreadedExecutor) -> None:
-    """Run subscriptions until normal shutdown without a thread traceback."""
-    try:
-        executor.spin()
-    except ExternalShutdownException:
-        pass
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -285,7 +277,7 @@ def main() -> int:
                         help="maximum RGB/depth timestamp difference within one camera")
     parser.add_argument("--settle", type=float, default=1.0,
                         help="seconds to wait after ENTER before accepting new frames")
-    args = parser.parse_args()
+    args = parser.parse_args(rospy.myargv(sys.argv)[1:])
     if args.timeout <= 0 or args.max_depth_skew_ms < 0 or args.settle < 0:
         parser.error("timeout must be positive; skew and settle limits must be non-negative")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -295,19 +287,13 @@ def main() -> int:
     if len({camera.name for camera in cameras}) != len(cameras):
         parser.error("camera names must be unique")
 
-    rclpy.init()
-    node = Node("stationary_rgbd_capture")
-    streams = [CameraStream(node, camera) for camera in cameras]
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    executor_thread = threading.Thread(target=spin_until_shutdown,
-                                       args=(executor,), daemon=True)
-    executor_thread.start()
+    rospy.init_node("stationary_rgbd_capture", anonymous=True, disable_signals=True)
+    streams = [CameraStream(camera) for camera in cameras]
 
     print("Watching: " + ", ".join(f"{camera.name} ({camera.prefix})" for camera in cameras))
     print("Let the board and depth temporal filters settle. ENTER captures; q then ENTER quits.")
     try:
-        while rclpy.ok():
+        while not rospy.is_shutdown():
             command = input("\n[ENTER] capture > ").strip().lower()
             if command in {"q", "quit", "exit"}:
                 break
@@ -325,12 +311,10 @@ def main() -> int:
                   "diagnostic only)")
     except KeyboardInterrupt:
         print("\nCapture stopped.")
+    except EOFError:
+        pass
     finally:
-        executor.shutdown()
-        executor_thread.join()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rospy.signal_shutdown("done")
     return 0
 
 

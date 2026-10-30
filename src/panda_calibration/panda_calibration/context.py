@@ -9,14 +9,14 @@ import yaml
 from .cameras import load_cameras
 from .kinematics import Chain
 
-PACKAGE = 'fr3_calibration'
+PACKAGE = 'panda_calibration'
 
 
 def share_directory() -> str:
     """Installed share directory, falling back to the source tree."""
     try:
-        from ament_index_python.packages import get_package_share_directory
-        return get_package_share_directory(PACKAGE)
+        import rospkg
+        return rospkg.RosPack().get_path(PACKAGE)
     except Exception:  # not built / not sourced -- run straight from source
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,8 +28,8 @@ def resolve(path: str) -> str:
     package, _, rest = path[len('package://'):].partition('/')
     if package == PACKAGE:
         return os.path.join(share_directory(), rest)
-    from ament_index_python.packages import get_package_share_directory
-    return os.path.join(get_package_share_directory(package), rest)
+    import rospkg
+    return os.path.join(rospkg.RosPack().get_path(package), rest)
 
 
 def default_config_path(name: str) -> str:
@@ -59,8 +59,9 @@ def load_camera_specs(path: str | None = None) -> dict:
 
 
 def build_chain(config: dict, urdf_xml: str | None = None) -> Chain:
-    """Chain from a live ``/robot_description`` string, or by running xacro on the
-    FR3 description (offline solves, or when no robot launch is running)."""
+    """Chain from the live ``/robot_description`` parameter string, or by running
+    xacro on the Panda description (offline solves, or when no robot launch is
+    running)."""
     robot = config['robot']
     kinematic_base_link = robot.get('kinematic_base_link', robot['base_link'])
     if urdf_xml:

@@ -27,10 +27,10 @@ try:  # Supports both ``python -m`` and direct execution during diagnosis.
     from .context import build_chain, load_config
     from .kinematics import Chain, axis_angle, make_transform, transform_from_xyz_rpy
 except ImportError:  # pragma: no cover - direct script invocation only
-    from fr3_calibration import tag as tag_module
-    from fr3_calibration.cameras import tag_corners
-    from fr3_calibration.context import build_chain, load_config
-    from fr3_calibration.kinematics import Chain, axis_angle, make_transform, transform_from_xyz_rpy
+    from panda_calibration import tag as tag_module
+    from panda_calibration.cameras import tag_corners
+    from panda_calibration.context import build_chain, load_config
+    from panda_calibration.kinematics import Chain, axis_angle, make_transform, transform_from_xyz_rpy
 
 
 MIN_SAMPLES = 4
@@ -315,7 +315,7 @@ def _load_joint_samples_from_capture(dataset: Path) -> dict[str, Any]:
                 camera_info[camera]))
 
     return {
-        'base_frame': meta.get('base_link', 'fr3_link0'),
+        'base_frame': meta.get('base_link', 'panda_link0'),
         'tag_size': tag_size,
         'tag_mount': None,
         'camera_info': camera_info,
@@ -1039,7 +1039,7 @@ def calibration_document(dataset: Path, camera_name: str, camera_frame: str | No
     selected_reprojection = [value for value, keep in zip(reprojection, inliers) if keep]
     return {
         'schema_version': 1,
-        'base_frame': meta.get('base_link', 'fr3_link0'),
+        'base_frame': meta.get('base_link', 'panda_link0'),
         'camera_frame': camera_frame or meta['cameras'][camera_name].get('frame_id', f'{camera_name}_camera'),
         'units': 'm',
         'T_base_camera': park.tolist(),

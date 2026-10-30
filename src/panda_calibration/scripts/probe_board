@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Approach a board point and descend in guarded steps."""
+import sys
+
+from panda_calibration.board_manipulation import main
+
+sys.exit(main())

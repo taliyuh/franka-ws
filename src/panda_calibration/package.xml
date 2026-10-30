@@ -1,34 +1,42 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>fr3_calibration</name>
-  <version>0.1.0</version>
+  <name>panda_calibration</name>
+  <version>0.2.0</version>
   <description>
-    Franka FR3 tools for the board pipeline: drives the arm through calibration
-    poses with the native PTP action and records camera frames + measured joints,
-    solves eye-to-hand calibrations, and probes board holes.
+    Franka Panda (FER, system 4.2.x, ROS Noetic) tools for the board pipeline:
+    drives the arm through calibration poses with franka_ros'
+    position_joint_trajectory_controller and records camera frames + measured
+    joints, solves eye-to-hand calibrations, and probes board holes.
   </description>
   <maintainer email="bartlomiej.hryniewski@gmail.com">bartek</maintainer>
   <license>Apache-2.0</license>
 
-  <exec_depend>rclpy</exec_depend>
-  <exec_depend>action_msgs</exec_depend>
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>python3-setuptools</build_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>actionlib</exec_depend>
+  <exec_depend>actionlib_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
   <exec_depend>control_msgs</exec_depend>
+  <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>franka_msgs</exec_depend>
   <exec_depend>moveit_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>python3-scipy</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <exec_depend>xacro</exec_depend>
   <exec_depend>franka_description</exec_depend>
+  <!-- Robot bringup (launch/robot.launch). -->
+  <exec_depend>franka_control</exec_depend>
+  <exec_depend>panda_moveit_config</exec_depend>
 
-  <export>
-    <build_type>ament_python</build_type>
-  </export>
 </package>

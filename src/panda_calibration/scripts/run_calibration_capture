@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Drive through a joint-pose list and record images + measured joints."""
+import sys
+
+from panda_calibration.capture_node import main
+
+sys.exit(main())

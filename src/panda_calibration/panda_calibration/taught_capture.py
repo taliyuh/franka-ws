@@ -10,23 +10,21 @@ import time
 
 import cv2
 import numpy as np
-import rclpy
+import rospy
 import yaml
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import MoveItErrorCodes
-from moveit_msgs.srv import GetPositionIK
-from rclpy.node import Node
+from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
 
-from .capture_node import CameraStream, LATCHED
+from .capture_node import CameraStream, robot_description
 from .context import build_chain, load_camera_specs, load_config
 from .kinematics import (
     make_transform,
     pose_error,
     quaternion_to_matrix,
 )
-from .trajectory_client import ArmDriver
+from .trajectory_client import ArmDriver, spin_once
 
 
 POSE_PATTERN = re.compile(
@@ -78,68 +76,76 @@ def save_records(path: str, records: list[dict], complete: bool) -> None:
     os.replace(temporary_path, path)
 
 
-class TaughtCapture(Node):
+class TaughtCapture:
     def __init__(self, config: dict, camera_specs: dict, args):
-        super().__init__('taught_capture')
         self.args = args
         self.config = config
         self.local_chain = None
         self.use_moveit_ik = None
-        self.robot_description = None
         self.joint_names = config['robot']['joint_names']
-        self.driver = ArmDriver(self, self.joint_names, config['motion'])
-        self.ik_client = self.create_client(GetPositionIK, 'compute_ik')
-        self.create_subscription(String, '/robot_description',
-                                 self._on_robot_description, LATCHED)
+        self.driver = ArmDriver(self.joint_names, config['motion'])
+        self.ik_service = config['robot'].get('ik_service', '/compute_ik')
+        self.ik_client = rospy.ServiceProxy(self.ik_service, GetPositionIK)
         self.streams = {
-            name: CameraStream(self, name, spec['image_topic'], spec['camera_info_topic'])
+            name: CameraStream(name, spec['image_topic'], spec['camera_info_topic'])
             for name, spec in camera_specs.items()
         }
 
-    def _on_robot_description(self, message: String) -> None:
-        self.robot_description = message.data
+    def shutdown(self) -> None:
+        self.driver.shutdown()
+        for stream in self.streams.values():
+            stream.shutdown()
 
     def wait_for_robot_description(self, timeout: float = 10.0) -> str | None:
-        deadline = time.monotonic() + timeout
-        while self.robot_description is None and time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-        return self.robot_description
+        return robot_description(timeout)
+
+    def ik_available(self, timeout: float) -> bool:
+        try:
+            rospy.wait_for_service(self.ik_service, timeout=timeout)
+            return True
+        except rospy.ROSException:
+            return False
 
     def wait_for_inputs(self) -> bool:
         if not self.args.manual and not self.driver.wait_for_controller():
-            self.get_logger().error('trajectory controller is unavailable')
+            rospy.logerr(f"trajectory controller {self.config['motion']['controller_action']} "
+                         'is unavailable; is position_joint_trajectory_controller running?')
             return False
         if not self.driver.wait_for_state():
-            self.get_logger().error('no /joint_states received')
+            rospy.logerr('no /joint_states received')
             return False
         self.use_moveit_ik = (
             False if self.args.manual
-            else self.ik_client.wait_for_service(timeout_sec=2.0)
+            else self.ik_available(2.0)
         )
         urdf = self.wait_for_robot_description()
         if urdf:
-            self.get_logger().info('using the live /robot_description for TCP FK')
+            rospy.loginfo('using the live /robot_description for TCP FK')
             self.kinematic_chain = build_chain(self.config, urdf)
         else:
-            self.get_logger().warn(
+            rospy.logwarn(
                 'no /robot_description; falling back to the packaged xacro for TCP FK')
             self.kinematic_chain = build_chain(self.config)
         if not self.use_moveit_ik:
-            self.get_logger().warn('MoveIt IK unavailable; using local FR3 IK')
+            rospy.logwarn('MoveIt IK unavailable; using local Panda IK')
             self.local_chain = self.kinematic_chain
+
+        frame_problem = self.driver.check_measured_tcp_frame(self.kinematic_chain)
+        if frame_problem:
+            rospy.logwarn(frame_problem)
 
         if self.args.test:
             return True
 
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            spin_once(0.1)
             if all(stream.frame is not None and stream.info is not None
                    for stream in self.streams.values()):
                 return True
         missing = [name for name, stream in self.streams.items()
                    if stream.frame is None or stream.info is None]
-        self.get_logger().error(f'no image or camera_info from: {missing}')
+        rospy.logerr(f'no image or camera_info from: {missing}')
         return False
 
     def validate_ik_target(self, joints) -> list[float]:
@@ -169,9 +175,10 @@ class TaughtCapture(Node):
             if not converged:
                 raise RuntimeError('local IK could not solve this pose')
             return self.validate_ik_target(joints)
-        request = GetPositionIK.Request()
-        request.ik_request.group_name = 'fr3_arm'
-        request.ik_request.ik_link_name = 'fr3_hand_tcp'
+        request = GetPositionIKRequest()
+        request.ik_request.group_name = self.config['robot'].get('move_group', 'panda_manipulator')
+        request.ik_request.ik_link_name = self.config['robot']['tip_link']
+        request.ik_request.timeout = rospy.Duration(0.5)
         request.ik_request.avoid_collisions = True
         request.ik_request.robot_state.joint_state = JointState()
         request.ik_request.robot_state.joint_state.name = self.joint_names
@@ -184,11 +191,10 @@ class TaughtCapture(Node):
         pose.position.x, pose.position.y, pose.position.z = xyz
         pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = xyzw
 
-        future = self.ik_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
-        if not future.done():
-            raise RuntimeError('timed out waiting for MoveIt IK')
-        response = future.result()
+        try:
+            response = self.ik_client(request)
+        except rospy.ServiceException as error:
+            raise RuntimeError(f'MoveIt IK call failed: {error}') from error
         if response.error_code.val != MoveItErrorCodes.SUCCESS:
             raise RuntimeError(f'MoveIt IK failed with error code {response.error_code.val}')
 
@@ -219,8 +225,8 @@ class TaughtCapture(Node):
                 'frame_id': str(stream.info.header.frame_id),
                 'width': int(stream.info.width),
                 'height': int(stream.info.height),
-                'K': [float(value) for value in stream.info.k],
-                'D': [float(value) for value in stream.info.d],
+                'K': [float(value) for value in stream.info.K],
+                'D': [float(value) for value in stream.info.D],
                 'image_stamp_s': None if stream.image_stamp_s is None else float(stream.image_stamp_s),
                 'image_received_monotonic_s': (
                     None if stream.image_received_monotonic_s is None
@@ -269,22 +275,22 @@ def run_manual_capture(node: TaughtCapture, records: list[dict],
             break
 
         if not node.driver.wait_until_stationary(settle_timeout):
-            node.get_logger().error(
+            rospy.logerr(
                 f'pose {next_index}: arm did not remain stationary for '
                 f'{float(node.config["motion"]["settle_hold"]):.3f} s')
             continue
         try:
             record = node.capture(next_index, None, None, None)
         except RuntimeError as error:
-            node.get_logger().error(f'pose {next_index}: {error}')
+            rospy.logerr(f'pose {next_index}: {error}')
             continue
         records.append(record)
         save_records(manifest_path, records, complete=False)
-        node.get_logger().info(f'captured manual pose {next_index}')
+        rospy.loginfo(f'captured manual pose {next_index}')
         next_index += 1
 
     save_records(manifest_path, records, complete=True)
-    node.get_logger().info(f'completed manual capture with {len(records)} poses')
+    rospy.loginfo(f'completed manual capture with {len(records)} poses')
     return 0
 
 
@@ -294,7 +300,7 @@ def main(argv=None) -> int:
     parser.add_argument('--cameras', help='camera YAML with image and camera_info topics')
     parser.add_argument('--out', default='taught_capture', help='directory for poses.yaml and images')
     parser.add_argument('--config', default=None)
-    parser.add_argument('--frame-id', default='fr3_link0')
+    parser.add_argument('--frame-id', default='panda_link0')
     parser.add_argument('--speed-scale', type=float, default=0.15)
     parser.add_argument('--resume', action='store_true',
                         help='skip samples already committed in poses.yaml')
@@ -302,7 +308,7 @@ def main(argv=None) -> int:
                         help='move the arm by hand and press Enter to capture each pose')
     parser.add_argument('--test', action='store_true',
                         help='move and validate live inputs without writing any data')
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv if argv is not None else rospy.myargv(sys.argv)[1:])
 
     if args.manual and args.test:
         parser.error('--manual and --test cannot be combined')
@@ -324,7 +330,7 @@ def main(argv=None) -> int:
     if not args.test:
         os.makedirs(os.path.join(args.out, 'images'), exist_ok=True)
 
-    rclpy.init()
+    rospy.init_node('taught_capture', anonymous=True, disable_signals=True)
     node = TaughtCapture(config, camera_specs, args)
     manifest_path = os.path.join(args.out, 'poses.yaml')
     try:
@@ -343,7 +349,7 @@ def main(argv=None) -> int:
             return run_manual_capture(node, records, manifest_path)
         for position, (pose_index, xyz, xyzw) in enumerate(poses):
             if pose_index in committed_indices:
-                node.get_logger().info(f'skipping committed pose {pose_index}')
+                rospy.loginfo(f'skipping committed pose {pose_index}')
                 continue
             input(f'Press Enter to move to pose {pose_index} ({position + 1}/{len(poses)}), '
                   'or Ctrl-C to stop... ')
@@ -354,26 +360,26 @@ def main(argv=None) -> int:
                     args.speed_scale,
                 )
             except RuntimeError as error:
-                node.get_logger().error(f'pose {pose_index}: {error}')
+                rospy.logerr(f'pose {pose_index}: {error}')
                 return 1
             if not ok:
-                node.get_logger().error(f'pose {pose_index}: {message}')
+                rospy.logerr(f'pose {pose_index}: {message}')
                 return 1
             requested_pose = make_transform(quaternion_to_matrix(xyzw), xyz)
             measured_pose = node.kinematic_chain.fk(node.driver.positions)
             position_error, rotation_error = pose_error(requested_pose, measured_pose)
-            node.get_logger().info(
+            rospy.loginfo(
                 f'pose {pose_index}: measured TCP differs from requested pose by '
                 f'{position_error * 1000.0:.3f} mm and '
                 f'{np.degrees(rotation_error):.4f} deg; using measured pose')
             try:
                 records.append(node.capture(pose_index, target, xyz, xyzw))
             except RuntimeError as error:
-                node.get_logger().error(f'pose {pose_index}: {error}')
+                rospy.logerr(f'pose {pose_index}: {error}')
                 return 1
             if not args.test:
                 save_records(manifest_path, records, complete=False)
-            node.get_logger().info(f'captured pose {pose_index}')
+            rospy.loginfo(f'captured pose {pose_index}')
 
         if not args.test:
             save_records(manifest_path, records, complete=True)
@@ -381,13 +387,13 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         if not args.test:
             save_records(manifest_path, records, complete=False)
-        node.get_logger().warn(
+        rospy.logwarn(
             f'capture interrupted; {len(records)} committed poses remain in '
             f'{manifest_path}')
         return 130
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        node.shutdown()
+        rospy.signal_shutdown('done')
 
 
 if __name__ == '__main__':

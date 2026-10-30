@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Single-camera eye-to-hand solve."""
+import sys
+
+from panda_calibration.solve_handeye import main
+
+sys.exit(main())

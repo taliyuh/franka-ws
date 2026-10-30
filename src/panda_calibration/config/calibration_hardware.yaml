@@ -1,28 +1,32 @@
-# Configuration for the FR3 eye-to-hand calibration pose driver.
+# Configuration for the Franka Panda (FER) calibration pose driver.
 
 robot:
-  base_link: base           # Match the live MoveIt planning frame.
-  tip_link: fr3_hand_tcp
-  joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4,
-                fr3_joint5, fr3_joint6, fr3_joint7]
+  base_link: panda_link0    # Match the live MoveIt planning frame.
+  tip_link: panda_hand_tcp
+  joint_names: [panda_joint1, panda_joint2, panda_joint3, panda_joint4,
+                panda_joint5, panda_joint6, panda_joint7]
   # Used when /robot_description is not available (offline solves). Same
-  # kinematics as the live description published by the robot launch.
-  xacro: package://franka_description/robots/fr3/fr3.urdf.xacro
+  # kinematics as the live description loaded by franka_control.launch.
+  xacro: package://franka_description/robots/panda/panda.urdf.xacro
   xacro_mappings:
     hand: 'true'
-    ee_id: franka_hand
+    arm_id: panda
+  # MoveIt IK (panda_moveit_config): the group whose tip is tip_link. Without
+  # move_group running, the tools fall back to the local numeric IK.
+  move_group: panda_manipulator
+  ik_service: /compute_ik
 
 tag:
   family: 4x4_50
   id: 0
   # Side length of the BLACK SQUARE only, in metres. Not the white border.
   size: 0.106
-  # Pose of the tag frame relative to fr3_hand_tcp.
+  # Pose of the tag frame relative to panda_hand_tcp.
   #
   # Derived from "in the default (ready) configuration the gripper points along
-  # world -Z and the tag faces world +X": at `ready`, fr3_hand_tcp has
+  # world -Z and the tag faces world +X": at `ready`, panda_hand_tcp has
   # tcp-X -> world +X and tcp-Z -> world -Z, so the tag's outward normal (+Z of
-  # the tag frame) is fr3_hand_tcp +X.  rpy (-pi/2, 0, -pi/2) gives
+  # the tag frame) is panda_hand_tcp +X.  rpy (-pi/2, 0, -pi/2) gives
   # tag-X -> tcp -Y, tag-Y -> tcp -Z, tag-Z -> tcp +X.
   #
   # Measure this on the real plate and update; the calibration itself does not
@@ -44,13 +48,13 @@ tag:
 occluders:
   radius: 0.065
   link_radius:
-    fr3_link0: 0.09
-    fr3_link1: 0.07
-    fr3_link2: 0.07
-    fr3_link3: 0.07
-    fr3_link4: 0.07
-    fr3_link7: 0.05
-    fr3_hand: 0.07
+    panda_link0: 0.09
+    panda_link1: 0.07
+    panda_link2: 0.07
+    panda_link3: 0.07
+    panda_link4: 0.07
+    panda_link7: 0.05
+    panda_hand: 0.07
 
 visibility:
   border_px: 30.0           # keep corners this far inside the image
@@ -63,7 +67,7 @@ pose_generation:
   count: 15
   seed: 20260829
   # Sampling box for the tag centre, chosen for the configured camera frusta
-  # while staying comfortably inside the FR3 workspace. This same hardware
+  # while staying comfortably inside the Panda workspace. This same hardware
   # config works with either one camera or the dual-camera YAML.
   centre: [0.40, 0.35, 0.45]
   extents: [0.16, 0.22, 0.16]
@@ -85,40 +89,42 @@ pose_generation:
     base_height: 0.35
 
 motion:
-  # The native Franka action uses AsyncPositionControlHandler and generates a
-  # jerk-limited point-to-point motion.  The generic position JTC can trigger
-  # libfranka's velocity/acceleration discontinuity reflex on real hardware.
-  action_type: ptp_motion
-  controller_action: /action_server/ptp_motion
-  # The aggregate /joint_states topic is normally published at 30 Hz by
-  # franka_bringup. Use the Franka broadcaster's measured 1 kHz arm state for
-  # the terminal precision check; trajectory control itself remains native PTP.
-  measured_joint_state_topic: /franka_robot_state_broadcaster/measured_joint_states
-  # With the gripper loaded, current_pose is the measured O->fr3_hand_tcp pose
-  # published by the Franka state broadcaster, rather than nominal-URDF FK.
-  measured_tcp_pose_topic: /franka_robot_state_broadcaster/current_pose
-  measured_tcp_pose_frame: base
+  # One single-point FollowJointTrajectory goal per move to franka_control's
+  # position_joint_trajectory_controller (libfranka joint position interface,
+  # franka_control's rate limiter on). Zero end velocity and acceleration make
+  # the controller interpolate a quintic, so the command has no acceleration
+  # jump for libfranka's discontinuity reflexes. robot.launch starts it.
+  action_type: follow_joint_trajectory
+  controller_action: /position_joint_trajectory_controller/follow_joint_trajectory
+  # The aggregate /joint_states topic is published at 30 Hz by
+  # joint_state_publisher. franka_state_controller publishes the measured arm
+  # joints at its publish_rate (robot.launch sets 250 Hz) for the settle and
+  # image-bracketing checks.
+  measured_joint_state_topic: /franka_state_controller/joint_states
+  # franka_msgs/FrankaState: O_T_EE is the robot's measured pose of the Desk
+  # end effector (Franka Hand -> identical to panda_hand_tcp), rather than
+  # nominal-URDF FK. The tools verify that once at startup. Its header has no
+  # frame_id, so the frame is stated here.
+  measured_tcp_pose_topic: /franka_state_controller/franka_states
+  measured_tcp_pose_frame: panda_link0
   max_joint_speed: 0.4      # rad/s, before --speed-scale
   min_duration: 2.0         # s, floor on any point-to-point move
-  min_joint_speed: 0.02     # rad/s, floor on the PTP velocity limit of small moves
-  # Upper bound for the native action's joint criterion. For Cartesian moves,
-  # the driver tightens this per pose from the live Jacobian and the Cartesian
-  # error limits below.
-  ptp_goal_tolerance: 0.002 # rad
+  goal_time_tolerance: 0.5  # s the controller may overrun the trajectory end
   settle_motion: 0.002      # rad; max joint movement across the settle window
-                            # (position-based: fr3_joint7 reports a bogus constant
-                            # velocity in Gazebo, so velocity cannot be trusted)
+                            # (position-based: reported velocities are not
+                            # trusted, e.g. a constant offset in simulation)
   max_position_error: 0.06  # rad; legacy joint-space settling gate
   # Final Cartesian target tolerance checked against the measured Franka TCP.
   max_cartesian_position_error_m: 0.0001
   # atan2(0.0001, 0.125): 0.1 mm lateral error at the user's 125 mm tool length.
   max_cartesian_rotation_error_rad: 0.000799999829333
-  # The native PTP action can settle with a small repeatable load/model
-  # residual. Retry only sub-mm residuals; a larger residual is treated as a
-  # wrong target/TCP and aborts instead of being silently accepted.
+  # The arm can settle with a small repeatable load/model residual. Retry only
+  # sub-mm residuals; a larger residual is treated as a wrong target/TCP and
+  # aborts instead of being silently accepted.
   cartesian_correction_attempts: 3
   # Observed on the FR3 with the wrist camera: ~0.9 mm / 0.12 deg after the
-  # first move (the arm settles short under the wrist load).
+  # first move (the arm settles short under the wrist load). Not yet measured
+  # on the Panda; keep the window until it is.
   cartesian_correction_window_m: 0.002
   cartesian_correction_window_rad: 0.004
   settle_hold: 0.5          # s the settle condition must hold

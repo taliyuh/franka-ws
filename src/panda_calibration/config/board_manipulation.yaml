@@ -19,11 +19,11 @@ probe:
   # farther into the board.
   max_descent_m: 0.15
 
-  # Orientation of fr3_hand_tcp relative to the board frame. This default makes
+  # Orientation of panda_hand_tcp relative to the board frame. This default makes
   # TCP +Z point toward board -Z. Measure/update it for the actual pen mount.
   tcp_orientation_board_rpy: [3.141592653589793, 0.0, 0.0]
 
-  # Vector from fr3_hand_tcp origin to the physical pen tip, expressed in TCP
+  # Vector from panda_hand_tcp origin to the physical pen tip, expressed in TCP
   # axes. The measured 12.5 cm pen is assumed coaxial with TCP +Z; in the
   # downward pose TCP +Z points toward the board. This value is used to place
   # the pen tip, not the TCP origin, on the requested board coordinate.

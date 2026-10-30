@@ -1,7 +1,7 @@
-"""Drive the FR3 through the generated calibration poses and record the dataset.
+"""Drive the Panda through the generated calibration poses and record the dataset.
 
 Scope is motion + capture: for every pose this records the measured joint
-vector, the resulting ``base -> fr3_hand_tcp`` transform, and one image plus
+vector, the resulting ``panda_link0 -> panda_hand_tcp`` transform, and one image plus
 ``camera_info`` per camera.  Solving for ``base -> camera`` is left to whatever
 downstream tool you prefer; ``meta.yaml`` states which convention the recorded
 transforms use.
@@ -19,28 +19,27 @@ import time
 
 import cv2
 import numpy as np
-import rclpy
+import rospy
 import yaml
 from cv_bridge import CvBridge
-from rclpy.node import Node
-from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
-                       QoSReliabilityPolicy, qos_profile_sensor_data)
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
 
 from . import tag as tag_module
 from .cameras import PinholeCamera
 from .context import build_chain, load_camera_set, load_camera_specs, load_config
-from .kinematics import FR3_READY, matrix_to_quaternion
+from .kinematics import PANDA_READY, matrix_to_quaternion
 from .pose_generator import PoseGenerator, save_poses
-from .trajectory_client import ArmDriver
+from .trajectory_client import ArmDriver, spin_once, stamp_seconds
 
-LATCHED = QoSProfile(
-    depth=1,
-    history=QoSHistoryPolicy.KEEP_LAST,
-    reliability=QoSReliabilityPolicy.RELIABLE,
-    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-)
+
+def robot_description(timeout: float = 10.0):
+    """The URDF from the ``/robot_description`` parameter, or None."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not rospy.is_shutdown():
+        if rospy.has_param('/robot_description'):
+            return rospy.get_param('/robot_description')
+        time.sleep(0.1)
+    return None
 
 
 class CameraStream:
@@ -51,8 +50,7 @@ class CameraStream:
     the arm stopped even though it was exposed before the stop.
     """
 
-    def __init__(self, node: Node, name: str, image_topic: str, info_topic: str):
-        self.node = node
+    def __init__(self, name: str, image_topic: str, info_topic: str):
         self.name = name
         self.frame = None
         self.frames_seen = 0
@@ -61,24 +59,32 @@ class CameraStream:
         self._latest_record = None
         self.info = None
         self._bridge = CvBridge()
-        node.create_subscription(Image, image_topic, self._on_image,
-                                 qos_profile_sensor_data)
-        node.create_subscription(CameraInfo, info_topic, self._on_info, 1)
+        # One-deep queue and a large buffer: a 4K BGRA frame is ~33 MB, and
+        # only the newest image matters.
+        self._subscribers = [
+            rospy.Subscriber(image_topic, Image, self._on_image, queue_size=1,
+                             buff_size=2 ** 27),
+            rospy.Subscriber(info_topic, CameraInfo, self._on_info, queue_size=1),
+        ]
+
+    def shutdown(self) -> None:
+        for subscriber in self._subscribers:
+            subscriber.unregister()
 
     def _on_image(self, msg: Image) -> None:
         try:
             self.frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as error:  # noqa: BLE001 - report and keep going
-            self.node.get_logger().warn(f'{self.name}: cv_bridge failed: {error}')
+            rospy.logwarn(f'{self.name}: cv_bridge failed: {error}')
             return
-        stamp = msg.header.stamp
-        self.image_stamp_s = stamp.sec + stamp.nanosec * 1e-9
+        self.image_stamp_s = stamp_seconds(msg.header.stamp)
         self.image_received_monotonic_s = time.monotonic()
         self._latest_record = {
             'header_stamp_s': float(self.image_stamp_s),
             'received_unix_s': float(time.time()),
             'received_monotonic_s': float(self.image_received_monotonic_s),
             'frame_id': msg.header.frame_id,
+            'image': self.frame,
         }
         self.frames_seen += 1
 
@@ -115,7 +121,7 @@ class CameraStream:
                     continue
                 if (minimum_header_stamp_s is not None
                         and record['header_stamp_s'] < minimum_header_stamp_s):
-                    self.node.get_logger().warn(
+                    rospy.logwarn(
                         f'{self.name}: rejecting late frame with header timestamp '
                         f'{record["header_stamp_s"]:.6f} before settle '
                         f'{minimum_header_stamp_s:.6f}')
@@ -126,44 +132,33 @@ class CameraStream:
                 selected = dict(record)
                 selected['frames_seen_before_request'] = int(first_frame_count)
                 selected['frames_discarded_after_gates'] = int(valid_frames)
-                selected['image'] = self.frame.copy()
+                selected['image'] = record['image'].copy()
                 return selected
-            rclpy.spin_once(self.node, timeout_sec=0.05)
+            spin_once(0.01)
         return None
 
 
-class CaptureSession(Node):
+class CaptureSession:
     def __init__(self, config: dict, args):
-        super().__init__('calibration_capture')
         self.config = config
         self.args = args
-        self.robot_description = None
-
-        self.create_subscription(String, '/robot_description',
-                                 self._on_description, LATCHED)
         self.streams = {}
-
-    def _on_description(self, msg: String) -> None:
-        self.robot_description = msg.data
 
     # -- setup ------------------------------------------------------------- #
 
     def wait_for_robot_description(self, timeout: float = 10.0):
-        deadline = time.monotonic() + timeout
-        while self.robot_description is None and time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-        return self.robot_description
+        return robot_description(timeout)
 
     def start_streams(self, camera_specs: dict) -> None:
         for name, spec in camera_specs.items():
-            self.streams[name] = CameraStream(self, name, spec['image_topic'],
+            self.streams[name] = CameraStream(name, spec['image_topic'],
                                               spec['camera_info_topic'])
 
     def wait_for_cameras(self, timeout: float = 30.0) -> list:
         """Block until every stream has an image and camera_info.  Returns the missing ones."""
         deadline = time.monotonic() + timeout * self.args.timeout_scale
         while time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            spin_once(0.1)
             if all(s.frame is not None and s.info is not None for s in self.streams.values()):
                 return []
         return [name for name, s in self.streams.items()
@@ -178,7 +173,7 @@ def _pose_record(index: int, target, measured, tcp_pose, joint_names,
     settles slightly off its target costs accuracy in tag visibility but not in
     the recorded hand pose.
     """
-    return {
+    record = {
         'index': int(index),
         'joint_names': list(joint_names),
         'target_joints': [round(float(v), 6) for v in target],
@@ -242,9 +237,9 @@ def _camera_info_record(info) -> dict:
         'frame_id': info.header.frame_id,
         'width': int(info.width),
         'height': int(info.height),
-        'K': [float(v) for v in info.k],
-        'D': [float(v) for v in info.d],
-        'P': [float(v) for v in info.p],
+        'K': [float(v) for v in info.K],
+        'D': [float(v) for v in info.D],
+        'P': [float(v) for v in info.P],
         'distortion_model': info.distortion_model,
     }
 
@@ -257,16 +252,19 @@ def _write_yaml(path: str, payload: dict) -> None:
 def run(session: CaptureSession, chain, poses, args) -> int:
     config = session.config
     joint_names = config['robot']['joint_names']
-    driver = ArmDriver(session, joint_names, config['motion'], args.timeout_scale)
+    driver = ArmDriver(joint_names, config['motion'], args.timeout_scale)
 
-    session.get_logger().info(f"waiting for {config['motion']['controller_action']}")
+    rospy.loginfo(f"waiting for {config['motion']['controller_action']}")
     if not driver.wait_for_controller():
-        session.get_logger().error(
+        rospy.logerr(
             f"no {config['motion']['controller_action']}; is the robot launch running?")
         return 1
     if not driver.wait_for_state():
-        session.get_logger().error('no /joint_states received')
+        rospy.logerr('no /joint_states received')
         return 1
+    frame_problem = driver.check_measured_tcp_frame(chain)
+    if frame_problem:
+        rospy.logwarn(frame_problem)
 
     capture_config = config['capture']
     detect = capture_config['detect'] and not args.no_detect
@@ -280,18 +278,18 @@ def run(session: CaptureSession, chain, poses, args) -> int:
     detections = []
     failures = []
 
-    sequence = [('ready', FR3_READY)] + [(str(i), p) for i, p in enumerate(poses)]
+    sequence = [('ready', PANDA_READY)] + [(str(i), p) for i, p in enumerate(poses)]
     for label, target in sequence:
-        session.get_logger().info(f'--> pose {label}')
+        rospy.loginfo(f'--> pose {label}')
         ok, settle_error, message = driver.move_to(target, args.speed_scale)
         if not ok:
-            session.get_logger().error(f'pose {label}: {message}')
+            rospy.logerr(f'pose {label}: {message}')
             failures.append(label)
             if args.stop_on_failure:
                 return 1
             continue
         if message:
-            session.get_logger().warn(f'  pose {label}: {message}')
+            rospy.logwarn(f'  pose {label}: {message}')
         if label == 'ready':
             continue
 
@@ -300,7 +298,7 @@ def run(session: CaptureSession, chain, poses, args) -> int:
         index = int(label)
         settled_state = driver.last_settled_state
         if settled_state is None:
-            session.get_logger().error(f'pose {label}: no settled state snapshot')
+            rospy.logerr(f'pose {label}: no settled state snapshot')
             failures.append(label)
             if args.stop_on_failure:
                 return 1
@@ -317,7 +315,7 @@ def run(session: CaptureSession, chain, poses, args) -> int:
 
         if args.dry_run:
             records.append(record)
-            session.get_logger().info(
+            rospy.loginfo(
                 f'  reached, max joint error {record["max_joint_error"]:.4f} rad')
             continue
 
@@ -331,7 +329,7 @@ def run(session: CaptureSession, chain, poses, args) -> int:
                 (None if not timestamp_gate else settled_state['received_monotonic_s']),
             )
             if frame_record is None:
-                session.get_logger().warn(f'  {name}: no fresh frame arrived')
+                rospy.logwarn(f'  {name}: no fresh frame arrived')
                 per_camera[name] = {'detected': False, 'error': 'no frames'}
                 capture_error = f'{name}: no post-settle frame passed the timestamp gate'
                 continue
@@ -369,7 +367,7 @@ def run(session: CaptureSession, chain, poses, args) -> int:
             per_camera[name] = entry
 
         if capture_error and require_all_cameras:
-            session.get_logger().error(f'pose {index}: capture incomplete: {capture_error}')
+            rospy.logerr(f'pose {index}: capture incomplete: {capture_error}')
             failures.append(f'pose {index}: {capture_error}')
             return 1
 
@@ -378,19 +376,19 @@ def run(session: CaptureSession, chain, poses, args) -> int:
 
         if detect:
             seen = [n for n, e in per_camera.items() if e.get('detected')]
-            session.get_logger().info(
+            rospy.loginfo(
                 f'  joint error {record["max_joint_error"]:.4f} rad, '
                 f'tag seen by: {", ".join(seen) if seen else "NONE"}')
 
     if args.dry_run:
-        session.get_logger().info(
+        rospy.loginfo(
             f'dry run complete: {len(records)}/{len(poses)} poses reached'
             + (f', failures: {failures}' if failures else ''))
         return 1 if failures else 0
 
     _write_yaml(os.path.join(args.out, 'poses.yaml'),
-                {'convention': 'T_base_tcp maps points in fr3_hand_tcp into the '
-                               'robot base frame (base_link == world == fr3_link0)',
+                {'convention': 'T_base_tcp maps points in panda_hand_tcp into the '
+                               'robot base frame (base_link == panda_link0)',
                  'poses': records})
     _write_yaml(os.path.join(args.out, 'detections.yaml'), {'poses': detections})
     _write_yaml(os.path.join(args.out, 'meta.yaml'), {
@@ -417,13 +415,13 @@ def run(session: CaptureSession, chain, poses, args) -> int:
                       if not any(e.get('detected') for e in d['cameras'].values())]
         both = sum(1 for d in detections
                    if all(e.get('detected') for e in d['cameras'].values()))
-        session.get_logger().info(
+        rospy.loginfo(
             f'captured {len(records)} poses -> {args.out}; '
             f'tag seen by both cameras in {both}, by none in {len(undetected)}')
         if undetected:
-            session.get_logger().warn(f'  no detection at poses: {undetected}')
+            rospy.logwarn(f'  no detection at poses: {undetected}')
     else:
-        session.get_logger().info(f'captured {len(records)} poses -> {args.out}')
+        rospy.loginfo(f'captured {len(records)} poses -> {args.out}')
     return 1 if failures else 0
 
 
@@ -473,22 +471,22 @@ def main(argv=None) -> int:
     else:
         cameras = load_camera_set(args.cameras)
 
-    rclpy.init()
+    rospy.init_node('calibration_capture', anonymous=True, disable_signals=True)
     session = CaptureSession(config, args)
     try:
         urdf = session.wait_for_robot_description()
         if urdf:
-            session.get_logger().info('using the live /robot_description')
+            rospy.loginfo('using the live /robot_description')
         else:
-            session.get_logger().warn(
-                'no /robot_description; falling back to the FR3 xacro')
+            rospy.logwarn(
+                'no /robot_description; falling back to the Panda xacro')
         chain = build_chain(config, urdf)
 
         if not args.dry_run:
             session.start_streams(camera_specs)
             missing = session.wait_for_cameras()
             if missing:
-                session.get_logger().error(f'no image/camera_info from: {missing}')
+                rospy.logerr(f'no image/camera_info from: {missing}')
                 return 1
             # Live intrinsics win over whatever the config guessed.
             for name, stream in session.streams.items():
@@ -497,34 +495,33 @@ def main(argv=None) -> int:
         if args.reuse:
             from .pose_generator import load_joint_poses
             poses = load_joint_poses(args.reuse)
-            session.get_logger().info(f'replaying {len(poses)} poses from {args.reuse}')
+            rospy.loginfo(f'replaying {len(poses)} poses from {args.reuse}')
         else:
             generator = PoseGenerator(chain, cameras, config)
             generated = generator.generate(count=args.poses, seed=args.seed)
             if not generated:
-                session.get_logger().error('pose generation produced nothing')
+                rospy.logerr('pose generation produced nothing')
                 return 1
             if not args.dry_run:
                 os.makedirs(args.out, exist_ok=True)
                 save_poses(os.path.join(args.out, 'generated_poses.yaml'),
                            generated, config, cameras)
             visible = sum(1 for p in generated if len(p.visible_cameras) == len(cameras))
-            session.get_logger().info(
+            rospy.loginfo(
                 f'generated {len(generated)} poses '
                 f'({visible} visible to every camera)')
             poses = [p.joints for p in generated]
 
         return run(session, chain, poses, args)
     finally:
-        session.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        for stream in session.streams.values():
+            stream.shutdown()
+        rospy.signal_shutdown('done')
 
 
 def _ros_stripped_argv():
-    """Drop the ``--ros-args ...`` tail that ros2 run/launch appends."""
-    argv = sys.argv[1:]
-    return argv[:argv.index('--ros-args')] if '--ros-args' in argv else argv
+    """Drop the ``name:=value`` remappings that rosrun/roslaunch append."""
+    return rospy.myargv(sys.argv)[1:]
 
 
 if __name__ == '__main__':

@@ -4,9 +4,9 @@ import cv2
 import numpy as np
 
 try:
-    from fr3_calibration.cameras import tag_corners
-    from fr3_calibration.kinematics import make_transform, rotation_from_axis_angle
-    from fr3_calibration.solve_handeye import (
+    from panda_calibration.cameras import tag_corners
+    from panda_calibration.kinematics import make_transform, rotation_from_axis_angle
+    from panda_calibration.solve_handeye import (
         _leave_one_pose_out_validation,
         invert,
         joint_handeye_fit,

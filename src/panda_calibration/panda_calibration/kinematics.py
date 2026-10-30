@@ -1,4 +1,4 @@
-"""Minimal URDF forward/inverse kinematics for the FR3 arm.
+"""Minimal URDF forward/inverse kinematics for the Franka Panda arm.
 
 Deliberately dependency-free (numpy only): the container has no ``kdl_parser``,
 no ``moveit_py`` and no ``urdf_parser_py``, and hard-coding DH parameters would
@@ -15,10 +15,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-FR3_JOINT_NAMES = [f'fr3_joint{i}' for i in range(1, 8)]
+PANDA_JOINT_NAMES = [f'panda_joint{i}' for i in range(1, 8)]
 
 # Franka's "ready" pose, also the URDF's initial_value for each arm joint.
-FR3_READY = np.array([0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4])
+PANDA_READY = np.array([0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4])
 
 
 # --------------------------------------------------------------------------- #
@@ -341,13 +341,13 @@ class Chain:
         Returns ``(q, converged)``. Defaults target 0.1 mm and 0.046 deg
         convergence for the calibrated board task.
         The nullspace term biases the redundant DOF towards ``nullspace_target``
-        (``FR3_READY`` by default) so solutions stay in a sane elbow posture.
+        (``PANDA_READY`` by default) so solutions stay in a sane elbow posture.
         """
         lower, upper = self.limits
         lower = lower + limit_margin
         upper = upper - limit_margin
-        q = np.clip(np.array(FR3_READY if seed is None else seed, dtype=float), lower, upper)
-        bias = np.array(FR3_READY if nullspace_target is None else nullspace_target, dtype=float)
+        q = np.clip(np.array(PANDA_READY if seed is None else seed, dtype=float), lower, upper)
+        bias = np.array(PANDA_READY if nullspace_target is None else nullspace_target, dtype=float)
         identity = np.eye(len(q))
         eye6 = np.eye(6)
 
@@ -410,9 +410,9 @@ class Chain:
         """:meth:`ik` with random restarts.  Returns ``(q, converged)``."""
         rng = rng if rng is not None else np.random.default_rng(0)
         lower, upper = self.limits
-        seeds = [FR3_READY if seed is None else np.asarray(seed, dtype=float)]
+        seeds = [PANDA_READY if seed is None else np.asarray(seed, dtype=float)]
         if seed is not None:
-            seeds.append(FR3_READY)
+            seeds.append(PANDA_READY)
         best = None
         for attempt in range(attempts):
             candidate = (seeds[attempt] if attempt < len(seeds)
@@ -449,7 +449,7 @@ def check_configuration(chain: Chain, q, *, limit_margin: float = 0.1,
 
     frames = chain.link_frames(q)
     for link, transform in frames.items():
-        if link in (chain.base_link, 'fr3_link0'):
+        if link in (chain.base_link, 'panda_link0'):
             continue
         if transform[2, 3] < min_link_height:
             reasons.append(f'{link} below z={min_link_height:.2f} m')

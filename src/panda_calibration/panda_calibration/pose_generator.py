@@ -1,4 +1,4 @@
-"""Generate FR3 joint configurations suitable for eye-to-hand calibration.
+"""Generate Panda joint configurations suitable for eye-to-hand calibration.
 
 The hard part is not reachability, it is that AX=XB is only well conditioned
 when the poses differ by large rotations about *different* axes.  So the
@@ -18,7 +18,7 @@ import yaml
 from .cameras import VisibilityThresholds
 from .kinematics import (
     Chain,
-    FR3_READY,
+    PANDA_READY,
     check_configuration,
     invert,
     make_transform,
@@ -33,7 +33,7 @@ from .kinematics import (
 class CalibrationPose:
     index: int
     joints: np.ndarray
-    tcp_pose: np.ndarray          # base -> fr3_hand_tcp
+    tcp_pose: np.ndarray          # base -> panda_hand_tcp
     tag_pose: np.ndarray          # base -> tag
     views: dict = field(default_factory=dict)   # camera name -> TagView
 
@@ -151,7 +151,7 @@ class PoseGenerator:
         """
         roll_step = math.radians(float(self.settings['roll_step_deg']))
         roll_count = max(1, int(round(2 * math.pi / roll_step)))
-        seed = np.array(FR3_READY if seed_joints is None else seed_joints, dtype=float)
+        seed = np.array(PANDA_READY if seed_joints is None else seed_joints, dtype=float)
         produced = 0
 
         for attempt in range(int(self.settings['max_candidates'])):
@@ -237,7 +237,7 @@ class PoseGenerator:
         """Nearest-neighbour ordering in joint space, to keep the moves small."""
         remaining = list(poses)
         ordered = []
-        current = np.array(FR3_READY if start_joints is None else start_joints, dtype=float)
+        current = np.array(PANDA_READY if start_joints is None else start_joints, dtype=float)
         while remaining:
             nearest = min(remaining,
                           key=lambda p: float(np.max(np.abs(p.joints - current))))

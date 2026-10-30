@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<!--
+  Azure Kinect on the wrist, 4K lossless colour for the eye-in-hand pipeline.
+
+    roslaunch panda_calibration azure_4k.launch
+
+  Topics under /azure_camera: rgb/image_raw (bgra8 3840x2160),
+  rgb/camera_info, depth_to_rgb/image_raw (16UC1 mm, registered to colour).
+  depth_to_rgb is only computed while someone subscribes to it.
+-->
+<launch>
+  <arg name="namespace" default="azure_camera" />
+  <arg name="sensor_sn" default="" />
+  <arg name="fps" default="15" doc="2160P allows 5, 15 or 30 (30 only with NFOV)" />
+  <arg name="depth_mode" default="NFOV_UNBINNED" />
+
+  <group ns="$(arg namespace)">
+    <include file="$(find azure_kinect_ros_driver)/launch/driver.launch">
+      <!-- Never replace the robot's /robot_description with the camera URDF. -->
+      <arg name="overwrite_robot_description" value="false" />
+      <arg name="color_resolution" value="2160P" />
+      <arg name="color_format" value="bgra" />
+      <arg name="fps" value="$(arg fps)" />
+      <arg name="depth_mode" value="$(arg depth_mode)" />
+      <arg name="depth_unit" value="16UC1" />
+      <!-- A 4K point cloud costs a CPU core and nothing here reads it. -->
+      <arg name="point_cloud" value="false" />
+      <arg name="rgb_point_cloud" value="false" />
+      <arg name="sensor_sn" value="$(arg sensor_sn)" />
+      <arg name="required" value="true" />
+    </include>
+  </group>
+</launch>

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Joint eye-to-hand solve of several cameras."""
+import sys
+
+from panda_calibration.solve_handeye import main_joint
+
+sys.exit(main_joint())

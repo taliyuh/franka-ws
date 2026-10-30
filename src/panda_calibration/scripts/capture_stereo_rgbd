@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""One synchronized RGB-D frame per camera."""
+import sys
+
+from panda_calibration.capture_stereo_rgbd import main
+
+sys.exit(main())
