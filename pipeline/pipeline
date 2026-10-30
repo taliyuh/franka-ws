@@ -8,7 +8,7 @@
 set -euo pipefail
 if [[ -f /.dockerenv ]]; then
     echo "pipeline runs on the HOST, not in the container: it starts the ROS steps in" >&2
-    echo "the franka_ros2 container itself. In a host terminal, from the workspace, run:" >&2
+    echo "the franka_ros container itself. In a host terminal, from the workspace, run:" >&2
     echo "  ./pipeline/pipeline $*" >&2
     exit 2
 fi
