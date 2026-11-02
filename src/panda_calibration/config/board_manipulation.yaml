@@ -20,11 +20,15 @@ probe:
   max_descent_m: 0.15
 
   # Orientation of panda_hand_tcp relative to the board frame. This default makes
-  # TCP +Z point toward board -Z. Measure/update it for the actual pen mount.
+  # TCP +Z point toward board -Z. `pipeline check/probe` replace it per hole: the
+  # held peg is turned to the hole's yaw (by a multiple of its symmetry), and
+  # only the yaw of this value is kept, to choose among the equivalent turns.
   tcp_orientation_board_rpy: [3.141592653589793, 0.0, 0.0]
 
-  # Vector from panda_hand_tcp origin to the physical pen tip, expressed in TCP
-  # axes. The measured 12.5 cm pen is assumed coaxial with TCP +Z; in the
-  # downward pose TCP +Z points toward the board. This value is used to place
-  # the pen tip, not the TCP origin, on the requested board coordinate.
+  # Vector from panda_hand_tcp origin to the tool tip, expressed in TCP axes; the
+  # tip, not the TCP origin, is placed on the requested board coordinate. This
+  # default is the old 12.5 cm pen coaxial with TCP +Z. With the printed V-block
+  # fingers the pegs sit off-axis: `pipeline check/probe` replace this with the
+  # held peg's tip from pipeline/config/grasps.yaml (sessions/<name>/targets/
+  # <hole>_tool.yaml), so it only applies to probe_board run by hand.
   pen_tip_offset_tcp_m: [0.0, 0.0, 0.125]
