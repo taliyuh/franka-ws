@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 import numpy as np
 
-from board_pipeline import eye_in_hand, ros, stationary
+from board_pipeline import eye_in_hand, grasp, ros, stationary
 from board_pipeline.config import SETUPS, Config, PipelineError, load_yaml
 from board_pipeline.session import (BOARD_POSE, CALIBRATION, REUSED, Context, Session,
                                     run_stage, step_status)
@@ -133,13 +134,18 @@ def cmd_probe(cfg: Config, args) -> None:
     if args.hole not in holes:
         raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
     hole = holes[args.hole]
-    target = _module(session.cfg.setup).hole_target(session, session.cfg, hole, args.hole)
+    tool = grasp.hole_tool(session.cfg, hole, args.hole)
+    print(f"held peg: {tool.shape} in the V-block fingers (grasp width {tool.grasp_width_mm:.2f} mm), "
+          f"peg yaw {math.degrees(tool.peg_yaw):.2f} deg on the board, "
+          f"tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP")
+    target = _module(session.cfg.setup).hole_target(session, session.cfg, hole, args.hole, tool)
+    manipulation = grasp.write_manipulation_config(
+        session.cfg, tool, session.path / "targets" / f"{args.hole}_tool.yaml")
     dry = args.command == "check"
     argv = ["--board-pose", ros.container_path(session.cfg, target),
-            "--offset", hole["x_m"], hole["y_m"], args.height / 1000.0,
+            "--offset", float(tool.point[0]), float(tool.point[1]), args.height / 1000.0,
             "--config", ros.container_path(session.cfg, session.cfg.path(session.cfg["robot"]["config"])),
-            "--manipulation-config",
-            ros.container_path(session.cfg, session.cfg.path(session.cfg["robot"]["manipulation_config"]))]
+            "--manipulation-config", ros.container_path(session.cfg, manipulation)]
     if dry:
         argv.append("--dry-run")
     else:
@@ -190,11 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=cmd_stage)
 
     for command, text in (("check", "dry run: validate the target and IK, no motion"),
-                          ("probe", "move the probe tip onto a hole (guarded descent)")):
+                          ("probe", "move the held peg's tip onto a hole (guarded descent)")):
         p = sub.add_parser(command, help=text)
         p.add_argument("--hole", required=True, help="e.g. round_c3mm; `pipeline holes` lists them")
         p.add_argument("--height", type=float, default=0.0, metavar="MM",
-                       help="target height above the board surface, mm (default 0)")
+                       help="peg tip height above the board surface, mm (default 0)")
         p.set_defaults(func=cmd_probe)
     return parser
 

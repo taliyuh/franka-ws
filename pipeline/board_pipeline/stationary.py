@@ -135,5 +135,5 @@ def make_steps(stage: str) -> list[Step]:
             Step("export", "express the board in the robot base frame", export)]
 
 
-def hole_target(session, cfg, hole: dict, name: str) -> Path:
+def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
     return session.require(BOARD_POSE, "run `pipeline locate` first")

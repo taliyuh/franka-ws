@@ -26,6 +26,9 @@ robot:
   manipulation_config: src/fr3_calibration/config/board_manipulation.yaml
 
 holes: pipeline/config/holes.yaml
+# Where each peg sits in the printed V-block fingers (franka_fr3_fingers v2);
+# check/probe place the held peg, of the hole's shape, on the hole.
+grasps: pipeline/config/grasps.yaml
 
 # ---------------------------------------------------------------- eye in hand
 # Azure Kinect rigidly mounted on the wrist housing (fr3_link6, NOT joint 7).

@@ -602,11 +602,12 @@ def corner_distance_mm(a, b):
 
 
 # ============================================================== hole targets
-def hole_target(session, cfg, hole: dict, name: str) -> Path:
+def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
     """Board pose for probe_board, corrected for the joint offsets at this hole.
 
     probe_board / MoveIt use the nominal FR3 kinematics, but the real arm sits
-    at FK(q + dq). For the tool pose over the hole we solve the true joint
+    at FK(q + dq). For the TCP pose with the held peg (`tool`, see grasp.py)
+    on the hole we solve the true joint
     angles q_true, then express the board in the frame the nominal model
     believes in at that configuration:
 
@@ -617,13 +618,8 @@ def hole_target(session, cfg, hole: dict, name: str) -> Path:
     cal = Calibration.load(session.require(CALIBRATION, "run `pipeline calibrate` first"))
     board_file = session.require(BOARD_POSE, "run `pipeline locate` first")
     board = np.asarray(json.loads(board_file.read_text())["T_base_board"])
-    probe = load_yaml(cfg.path(cfg["robot"]["manipulation_config"]))["probe"]
-    tip_offset = np.asarray(probe["pen_tip_offset_tcp_m"], float)
-    rotation = board[:3, :3] @ Rotation.from_euler("xyz", probe["tcp_orientation_board_rpy"]).as_matrix()
-    tip = board @ np.r_[hole["x_m"], hole["y_m"], SURFACE_Z, 1]
-    target = np.eye(4)
-    target[:3, :3] = rotation
-    target[:3, 3] = tip[:3] - rotation @ tip_offset
+    target = tool.tcp_pose(board, SURFACE_Z)
+    tip = board @ np.r_[tool.point, SURFACE_Z, 1]
 
     # IK seed: the look pose of the stage that produced board_pose.json.
     stage = json.loads(board_file.read_text()).get("source", {}).get("stage", "locate")

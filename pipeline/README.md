@@ -1,7 +1,7 @@
 # Board pipeline
 
 Calibrates a camera against the FR3, measures the pose of the NIST ATB board
-in the robot base frame, and drives a probe tip onto any of its 20 holes.
+in the robot base frame, and drives the tip of a held peg onto any of its 20 holes.
 
 Two camera setups are supported, with the same commands:
 
@@ -21,7 +21,7 @@ docker exec -it franka_ros2 bash -ic "cd /franka_ws && colcon build"   # after c
 ./pipeline/pipeline locate                       # ~5 min, the arm moves; skip it (eye_in_hand)
                                                  # if the board has not moved since calibrate
 ./pipeline/pipeline check --hole round_c3mm      # dry run: prints the target, no motion
-./pipeline/pipeline probe --hole round_c3mm      # moves the probe tip onto the hole
+./pipeline/pipeline probe --hole round_c3mm      # moves the held round peg's tip onto the hole
 ```
 
 `alias pipeline=$PWD/pipeline/pipeline` (run from the workspace) saves typing. The
@@ -86,19 +86,43 @@ origin is the centre of its bottom face, and the top surface is at z = 25 mm.
 ### `check` / `probe`
 
 `check --hole NAME` validates the target and IK without moving. `probe --hole NAME`
-approaches 15 cm above the hole, then descends in guarded steps:
+approaches 15 cm above the hole with the peg, then descends in guarded steps:
 
 * Enter approves the approach.
 * Enter during the descent stops it.
 * Enter again retracts.
 
-It never goes below the board surface. `--height MM` targets a point above
-the surface instead. Tool geometry (pen-tip offset, orientation) is in
+It never brings the peg tip below the board surface. `--height MM` targets a
+point above the surface instead. Approach and descent settings are in
 `src/fr3_calibration/config/board_manipulation.yaml`.
+
+**The held peg.** The gripper carries the printed V-block fingers
+(franka_fr3_fingers v2: finger A, the V-block, on `fr3_leftfinger`), which hold
+every peg off the TCP axis. The peg is assumed to be the one of the hole's
+shape, seated in the V with its top against the roof (gripper width as in
+`config/grasps.yaml`). Where each peg sits relative to `fr3_hand_tcp`:
+
+| peg       | peg axis from the TCP (hand x, y) | tip below the TCP | turns allowed |
+|-----------|-----------------------------------|-------------------|---------------|
+| round     | 0, +16.5 mm                       | 39 mm             | any           |
+| hexagon   | 0, +15.2 mm                       | 39 mm             | 60°           |
+| triangle  | 0, +17.0 mm                       | 39 mm             | 120°          |
+| rectangle | +0.5, +15.5 mm                    | 39 mm             | 180°          |
+| L         | +4.5, +17.0 mm                    | 39 mm             | none          |
+
+The peg frame is lined up with the hole frame. Of the allowed turns,
+the one that keeps the hand closest to the yaw of `tcp_orientation_board_rpy`
+is used. The resulting tool (TCP orientation and TCP-to-peg-tip vector) is
+written to `targets/<hole>_tool.yaml` and replaces the pen settings of
+`board_manipulation.yaml` for that hole. The offsets are nominal CAD values
+from `grasp_poses_v2.json`, registered onto the hole-frame convention by
+`tools/extract_grasps.py` (run it in the rl_manip checkout, like
+`extract_holes.py`).
 
 For eye_in_hand, the board pose is corrected for the calibrated joint
 offsets at the chosen hole, because MoveIt plans with the nominal kinematics.
-The corrected target is written to `targets/<hole>.json`.
+The corrected target is written to `targets/<hole>.json`, next to the
+peg tool `targets/<hole>_tool.yaml`.
 
 `pipeline holes` lists the hole names (`<shape>_c<clearance>mm`, e.g.
 `hexagon_c0p2mm`) with board coordinates. Once a session has a board pose, it
@@ -153,7 +177,8 @@ edit that copy; to change future sessions, edit the template.
 | `board_pipeline/ros.py` | `docker exec` bridge, host/container path mapping |
 | `board_pipeline/fr3.py` | FR3 DH kinematics and IK |
 | `ros_nodes/grab_azure_rgbd.py` | single RGB-D frame grabber (runs in the container) |
-| `config/` | settings template, hole table, look pose, prior hand-eye, calibration poses |
+| `board_pipeline/grasp.py` | held peg: TCP pose and tool tip that put it on a hole |
+| `config/` | settings template, hole and grasp tables, look pose, prior hand-eye, calibration poses |
 
 ## Troubleshooting
 
