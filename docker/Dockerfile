@@ -127,6 +127,28 @@ RUN source /opt/ros/noetic/setup.bash \
     && rm -rf build log
 
 # ---------------------------------------------------------------------------
+# Mesa 25 for the Azure Kinect depth engine
+# ---------------------------------------------------------------------------
+# The depth engine computes depth with OpenGL. Ubuntu 20.04's Mesa 21.2 does not
+# know this PC's Intel GPU ("Driver does not support the 0xa7ab PCI ID") and
+# falls back to llvmpipe, software rendering on every CPU core, which starves
+# libfranka's 1 kHz loop (communication_constraints_violation reflexes). kisak's
+# turtle PPA still builds current Mesa for focal (kisak-mesa no longer does);
+# with it the iris driver renders on the GPU. Kept last so that changing it does
+# not rebuild the underlay.
+RUN curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xEB8B81E14DA65431D7504EA8F63F0F2B90935439" \
+       | gpg --dearmor --yes -o /usr/share/keyrings/kisak-turtle.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/kisak-turtle.gpg] https://ppa.launchpadcontent.net/kisak/turtle/ubuntu focal main" \
+       > /etc/apt/sources.list.d/kisak-turtle.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+       libgl1-mesa-dri \
+       libglx-mesa0 \
+       libegl-mesa0 \
+       libgbm1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
 # Workspace Setup
 # ---------------------------------------------------------------------------
 WORKDIR /franka_ws

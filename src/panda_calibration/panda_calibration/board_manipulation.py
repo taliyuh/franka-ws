@@ -44,13 +44,22 @@ PROBE_ACTION_TYPE = 'follow_joint_trajectory'
 PROBE_ACTION = '/position_joint_trajectory_controller/follow_joint_trajectory'
 
 
-def compensate_pose_for_measured_error(desired: np.ndarray,
+def compensate_pose_for_measured_error(command: np.ndarray,
+                                      desired: np.ndarray,
                                       actual: np.ndarray) -> np.ndarray:
-    """Return a first-order command correction for a measured TCP residual."""
-    corrected = desired.copy()
+    """Return *command* shifted by the measured TCP residual *desired* - *actual*.
+
+    The shift accumulates on the previous command: restarting from *desired*
+    would undo the last correction, so a repeatable sag would alternate between
+    corrected and uncorrected poses instead of converging.
+    """
+    corrected = command.copy()
     corrected[:3, 3] += desired[:3, 3] - actual[:3, 3]
-    corrected[:3, :3] = (
-        desired[:3, :3] @ actual[:3, :3].T @ desired[:3, :3])
+    # O_T_EE is orthonormal only to about 3e-5 on the Panda. Project the result
+    # back onto a rotation: MoveIt's KDL IK fails (NO_IK_SOLUTION) on the
+    # non-unit quaternion the skewed matrix would give.
+    u, _, vt = np.linalg.svd(desired[:3, :3] @ actual[:3, :3].T @ command[:3, :3])
+    corrected[:3, :3] = u @ vt
     return corrected
 
 
@@ -283,7 +292,8 @@ class BoardManipulation:
                     f'(limit {maximum_translation_error:.6f} m), {rotation_error:.6f} rad '
                     f'(limit {maximum_rotation_error:.6f} rad)')
 
-            command_pose = compensate_pose_for_measured_error(desired_pose, actual_pose)
+            command_pose = compensate_pose_for_measured_error(
+                command_pose, desired_pose, actual_pose)
             rospy.logwarn(
                 'measured TCP residual is within the correction window; '
                 'retrying with a compensated Cartesian command')

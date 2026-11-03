@@ -7,7 +7,7 @@ probe:
   # approach_height_m above the board.
   staging_z_m: null
   # Clearance from the board plane for the approach pose.
-  approach_height_m: 0.15
+  approach_height_m: 0.02
   # Fast, safe repositioning in X/Y at the current/safe staging height.
   approach_speed_scale: 0.50
   # Ten-times-faster descent profile: larger guarded steps avoid paying the
@@ -27,4 +27,4 @@ probe:
   # axes. The measured 12.5 cm pen is assumed coaxial with TCP +Z; in the
   # downward pose TCP +Z points toward the board. This value is used to place
   # the pen tip, not the TCP origin, on the requested board coordinate.
-  pen_tip_offset_tcp_m: [0.0, 0.0, 0.125]
+  pen_tip_offset_tcp_m: [0.0, 0.0, 0.04]

@@ -19,7 +19,7 @@ docker:
   workspace: /franka_ws
 
 robot:
-  ip: 172.16.0.2
+  ip: 192.168.1.1
   # Frames, trajectory action and motion limits used by every capture tool.
   config: src/panda_calibration/config/calibration_hardware.yaml
   # Probe tool: pen-tip offset, approach height, descent limits.

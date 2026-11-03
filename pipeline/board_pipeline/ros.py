@@ -109,6 +109,34 @@ def _blocks_motion(name: str) -> bool:
     return name in MOTION_BLOCKING or name.endswith("_example_controller")
 
 
+# franka_msgs/FrankaState robot_mode is MOVE while franka_control commands the
+# arm. After a reflex or a user stop it is not, but the trajectory controller
+# keeps running and accepts goals that then play out with the arm standing still.
+FRANKA_STATES = "/franka_state_controller/franka_states"
+ROBOT_MODES = {0: "OTHER", 1: "IDLE", 2: "MOVE", 3: "GUIDING", 4: "REFLEX",
+               5: "USER_STOPPED", 6: "AUTOMATIC_ERROR_RECOVERY"}
+ERROR_RECOVERY = ("rostopic pub -1 /franka_control/error_recovery/goal "
+                  "franka_msgs/ErrorRecoveryActionGoal \"{}\"")
+
+
+def robot_mode(cfg: Config) -> int | None:
+    """FrankaState robot_mode, None if no state arrives."""
+    echoed = output(cfg, ["rostopic", "echo", "-n1", f"{FRANKA_STATES}/robot_mode"],
+                    timeout=5.0).split()
+    return int(echoed[0]) if echoed and echoed[0].isdigit() else None
+
+
+def motion_errors(cfg: Config) -> list[str]:
+    """Names of the flags set in FrankaState last_motion_errors."""
+    listing = output(cfg, ["rostopic", "echo", "-n1", f"{FRANKA_STATES}/last_motion_errors"],
+                     timeout=5.0)
+    try:
+        flags = yaml.safe_load(listing.split("\n---")[0]) or {}
+    except yaml.YAMLError:
+        return []
+    return [name for name, value in flags.items() if value is True] if isinstance(flags, dict) else []
+
+
 def controller_states(cfg: Config) -> dict:
     """{controller name: state} from the controller_manager, empty if none answers."""
     listing = output(cfg, ["rosservice", "call", "/controller_manager/list_controllers"])
@@ -141,6 +169,22 @@ def check_robot_ready(cfg: Config) -> None:
                  f"\"{{start_controllers: [{MOTION_CONTROLLER}], stop_controllers: [], strictness: 2}}\"")
         raise PipelineError(f"{MOTION_CONTROLLER} is {state or 'not loaded'}; every pipeline motion "
                             f"is sent to it. Start it with\n  {start}")
+    mode = robot_mode(cfg)
+    name = ROBOT_MODES.get(mode, str(mode))
+    if mode is None or name == "MOVE":
+        return
+    recover = f"recover in the container:\n  {ERROR_RECOVERY}"
+    if name == "REFLEX":
+        errors = motion_errors(cfg)
+        cause = f" after {', '.join(errors)}" if errors else ""
+        raise PipelineError(
+            f"the robot is in reflex mode{cause}; franka_control does not move the arm until it "
+            f"is recovered, so every goal would play out with the arm standing still. Check "
+            f"that nothing presses on the arm or its cables, then {recover}")
+    if name == "USER_STOPPED":
+        raise PipelineError(f"the user stop is pressed; release it, then {recover}")
+    raise PipelineError(f"robot mode is {name}, not MOVE, so franka_control is not commanding "
+                        f"the arm; check Desk (joints unlocked, FCI active), then {recover}")
 
 
 def rosrun(cfg: Config, package: str, executable: str, *args, **kwargs) -> None:

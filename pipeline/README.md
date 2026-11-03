@@ -50,9 +50,11 @@ container by the name `franka_ros`.
 Before moving the arm: unlock the joints and activate FCI in Desk, and set the
 end effector in Desk to the Franka Hand. Every pipeline motion is a single
 `FollowJointTrajectory` goal to `position_joint_trajectory_controller`; the
-tools refuse to start if it is not running or if another command controller
-(e.g. `effort_joint_trajectory_controller`) holds the joints. After a reflex
-(collision, joint limit), franka_control stops the motion; recover with
+tools refuse to start if it is not running, if another command controller
+(e.g. `effort_joint_trajectory_controller`) holds the joints, or if the robot
+is in reflex or user-stop mode. After a reflex (collision, joint limit, a push
+on the arm), franka_control stops the arm until it is recovered; the trajectory
+controller keeps running, but no goal moves the arm. Recover with
 
 ```bash
 rostopic pub -1 /franka_control/error_recovery/goal franka_msgs/ErrorRecoveryActionGoal "{}"
@@ -213,6 +215,16 @@ edit that copy; to change future sessions, edit the template.
   that fixes it.
 * **A move fails with `trajectory goal ended in state ABORTED`**: usually a
   reflex; check franka_control's output, run the error recovery above, rerun.
+* **`the robot is in reflex mode after cartesian_reflex`**: something pressed on
+  the arm, the camera or its cable (or a move collided), and franka_control
+  stopped the arm. Free it, run the error recovery above, rerun. If it keeps
+  happening during moves, enter the wrist camera and its mount as extra load in
+  Desk: weight the robot does not know about eats into the 20 N Cartesian
+  reflex threshold (`O_F_ext_hat_K` in `/franka_state_controller/franka_states`
+  shows it while the arm stands still).
+* **`Error in XmlRpcClient::writeRequest: write error (Connection refused)`** in
+  the robot launch output: a node exited without unregistering (e.g. a camera
+  driver that crashed). Harmless; `rosnode cleanup` clears it.
 * **`seed fit failed`**: the board is not fully in view from the look pose.
   Jog the arm until it is, then run `pipeline locate --here`.
 * **A capture step times out waiting for images**: are the robot and camera

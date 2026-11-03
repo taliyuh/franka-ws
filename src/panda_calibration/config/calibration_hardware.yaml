@@ -119,14 +119,14 @@ motion:
   # atan2(0.0001, 0.125): 0.1 mm lateral error at the user's 125 mm tool length.
   max_cartesian_rotation_error_rad: 0.000799999829333
   # The arm can settle with a small repeatable load/model residual. Retry only
-  # sub-mm residuals; a larger residual is treated as a wrong target/TCP and
-  # aborts instead of being silently accepted.
+  # residuals inside the window below; a larger residual is treated as a wrong
+  # target/TCP and aborts instead of being silently accepted.
   cartesian_correction_attempts: 3
-  # Observed on the FR3 with the wrist camera: ~0.9 mm / 0.12 deg after the
-  # first move (the arm settles short under the wrist load). Not yet measured
-  # on the Panda; keep the window until it is.
-  cartesian_correction_window_m: 0.002
-  cartesian_correction_window_rad: 0.004
+  # Observed after the first move (the arm settles short under the wrist load):
+  # FR3 ~0.9 mm / 0.12 deg; Panda 1.2 mm / 0.23 deg at the probe approach pose
+  # (2026-11-02, camera not in Desk's load model). About twice the Panda value.
+  cartesian_correction_window_m: 0.003
+  cartesian_correction_window_rad: 0.008
   settle_hold: 0.5          # s the settle condition must hold
   goal_timeout_margin: 10.0 # s added on top of the trajectory duration
 

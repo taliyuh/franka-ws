@@ -31,10 +31,17 @@ from control_msgs.msg import (FollowJointTrajectoryAction, FollowJointTrajectory
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+ERROR_RECOVERY_COMMAND = ('rostopic pub -1 /franka_control/error_recovery/goal '
+                          'franka_msgs/ErrorRecoveryActionGoal "{}"')
 ERROR_RECOVERY_HINT = (
-    'if franka_control reports a reflex/error, recover with '
-    '`rostopic pub -1 /franka_control/error_recovery/goal '
-    'franka_msgs/ErrorRecoveryActionGoal "{}"`')
+    f'if franka_control reports a reflex/error, recover with `{ERROR_RECOVERY_COMMAND}`')
+
+# franka_msgs/FrankaState robot_mode. The arm is in MOVE whenever franka_control
+# runs a command controller. In any other mode (after a reflex, a user stop)
+# franka_control does not command the arm, but the trajectory controller keeps
+# running: it accepts goals and plays them out while the arm stands still.
+ROBOT_MODES = {0: 'OTHER', 1: 'IDLE', 2: 'MOVE', 3: 'GUIDING', 4: 'REFLEX',
+               5: 'USER_STOPPED', 6: 'AUTOMATIC_ERROR_RECOVERY'}
 
 GOAL_STATES = {getattr(GoalStatus, name): name for name in (
     'PENDING', 'ACTIVE', 'PREEMPTED', 'SUCCEEDED', 'ABORTED', 'REJECTED',
@@ -76,6 +83,8 @@ class ArmDriver:
         self._measured_tcp_pose = None
         self._measured_tcp_pose_frame = None
         self._measured_tcp_pose_received_monotonic_s = 0.0
+        self._robot_mode = None
+        self._motion_errors = ()
         self._subscribers = []
 
         self.state_topic = motion_config.get('measured_joint_state_topic', '/joint_states')
@@ -148,6 +157,12 @@ class ArmDriver:
             self._on_joint_state(msg)
 
     def _on_franka_state(self, msg) -> None:
+        # franka_msgs/Errors is all bool flags: keep the names of the set ones.
+        errors = tuple(name for name in msg.last_motion_errors.__slots__
+                       if getattr(msg.last_motion_errors, name))
+        with self._lock:
+            self._robot_mode = int(msg.robot_mode)
+            self._motion_errors = errors
         pose = column_major_transform(msg.O_T_EE)
         if pose.shape != (4, 4) or not np.isfinite(pose).all():
             return
@@ -166,6 +181,27 @@ class ArmDriver:
     @property
     def last_measured_tcp_pose_frame(self):
         return self._measured_tcp_pose_frame
+
+    def robot_mode_problem(self):
+        """Why franka_control cannot move the arm right now, or None.
+
+        Known only once a FrankaState has arrived (``measured_tcp_pose_topic``).
+        """
+        with self._lock:
+            mode = self._robot_mode
+            errors = self._motion_errors
+        name = ROBOT_MODES.get(mode, str(mode))
+        if mode is None or name == 'MOVE':
+            return None
+        if name == 'REFLEX':
+            cause = f' after {", ".join(errors)}' if errors else ''
+            return (f'the robot is in reflex mode{cause}; franka_control does not move the arm '
+                    'until it is recovered: check that nothing presses on the arm or its '
+                    f'cables, then run `{ERROR_RECOVERY_COMMAND}`')
+        if name == 'USER_STOPPED':
+            return f'the user stop is pressed; release it, then run `{ERROR_RECOVERY_COMMAND}`'
+        return (f'robot mode is {name}, not MOVE, so franka_control is not commanding the arm; '
+                f'check Desk (joints unlocked, FCI active), then run `{ERROR_RECOVERY_COMMAND}`')
 
     @property
     def positions(self):
@@ -262,12 +298,19 @@ class ArmDriver:
         recorded either way.  So the arm's own settled state is the deciding
         evidence, and only an error larger than ``motion.max_position_error``
         fails the move.
+
+        A robot that is not in MOVE mode (reflex, user stop) fails the move
+        before the goal is sent, and a reflex during the move is reported as
+        such rather than as a large settle error.
         """
         target = np.asarray(target, dtype=float)
         if cartesian_target is not None and kinematic_chain is None:
             raise ValueError('kinematic_chain is required for a Cartesian target check')
         if target.shape != (len(self.joint_names),) or not np.isfinite(target).all():
             raise ValueError('joint target must match the joint list and be finite')
+        problem = self.robot_mode_problem()
+        if problem:
+            return False, None, problem
         motion_started = time.monotonic()
         duration = self.duration_for(target, speed_scale)
 
@@ -310,12 +353,17 @@ class ArmDriver:
             return False, None, (
                 f'controller did not report a result within {budget:.1f} s; '
                 'cancellation requested')
+        # A reflex during the move stops the arm, not the goal: the controller
+        # plays it out and then fails it on the goal tolerance.
+        problem = self.robot_mode_problem()
+        if problem:
+            return False, None, f'the arm stopped during the move: {problem}'
         state = self.client.get_state()
         result = self.client.get_result()
         if state != GoalStatus.SUCCEEDED and (
                 result is None or result.error_code == FollowJointTrajectoryResult.SUCCESSFUL):
-            # Aborted/rejected without a controller error code: franka_control
-            # switched the controller off (reflex, user stop) or refused the goal.
+            # Aborted/rejected without a controller error code: the controller
+            # refused the goal or was stopped.
             text = self.client.get_goal_status_text()
             return False, None, (
                 f'trajectory goal ended in state {GOAL_STATES.get(state, state)}'

@@ -287,6 +287,10 @@ def run(session: CaptureSession, chain, poses, args) -> int:
             failures.append(label)
             if args.stop_on_failure:
                 return 1
+            if driver.robot_mode_problem():
+                # No later pose is reachable until the robot is recovered;
+                # keep the poses captured so far.
+                break
             continue
         if message:
             rospy.logwarn(f'  pose {label}: {message}')

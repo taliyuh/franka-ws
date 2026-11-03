@@ -12,9 +12,11 @@ from panda_calibration.board_pose import (
     tip_position_in_base,
     validate_board_offset,
 )
+from panda_calibration.board_manipulation import compensate_pose_for_measured_error
 from panda_calibration.kinematics import (
     conservative_joint_tolerances,
     make_transform,
+    matrix_to_quaternion,
     pose_error,
     rotation_from_axis_angle,
 )
@@ -96,6 +98,34 @@ class BoardManipulationGeometryTest(unittest.TestCase):
 
         self.assertLessEqual(translation_error, position_limit)
         self.assertLessEqual(rotation_error, rotation_limit)
+
+    def test_repeated_corrections_converge_on_a_constant_sag(self):
+        desired = make_transform(
+            rotation_from_axis_angle(np.array([1.0, 0.0, 0.0]), math.pi), [0.4, 0.1, 0.3])
+        sag = make_transform(
+            rotation_from_axis_angle(np.array([0.0, 1.0, 0.0]), 0.004), [0.0, 0.0, -0.0012])
+        command = desired.copy()
+        for _ in range(3):
+            actual = sag @ command  # the arm settles short by the same sag every time
+            command = compensate_pose_for_measured_error(command, desired, actual)
+
+        translation_error, rotation_error = pose_error(desired, sag @ command)
+        self.assertLess(translation_error, 1e-9)
+        self.assertLess(rotation_error, 1e-9)
+
+    def test_compensated_rotation_is_orthonormal_for_a_skewed_measurement(self):
+        # The Panda's O_T_EE is orthonormal only to ~3e-5; MoveIt's IK fails on
+        # the non-unit quaternion a skewed command rotation gives.
+        desired = make_transform(
+            rotation_from_axis_angle(np.array([1.0, 0.0, 0.0]), math.pi), [0.4, 0.1, 0.3])
+        actual = desired.copy()
+        actual[:3, :3] = (rotation_from_axis_angle(np.array([0.0, 1.0, 0.0]), 0.004)
+                          @ desired[:3, :3] * (1.0 - 1e-5))
+
+        rotation = compensate_pose_for_measured_error(desired, desired, actual)[:3, :3]
+
+        self.assertLess(np.linalg.norm(rotation.T @ rotation - np.eye(3)), 1e-12)
+        self.assertAlmostEqual(float(np.linalg.norm(matrix_to_quaternion(rotation))), 1.0, places=12)
 
     def test_joint_tolerance_is_conservative_for_jacobian_bound(self):
         jacobian = np.vstack((np.eye(3, 3), np.eye(3, 3)))
