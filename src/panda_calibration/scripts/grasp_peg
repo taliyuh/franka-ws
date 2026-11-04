@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Close the Franka Hand on a peg (franka_gripper grasp action)."""
+import sys
+
+from panda_calibration.gripper import main
+
+sys.exit(main())

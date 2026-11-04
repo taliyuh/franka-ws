@@ -25,6 +25,7 @@ docker exec -it franka_ros bash -ic "cd /franka_ws && colcon build"   # after co
 ./pipeline/pipeline calibrate                    # ~15 min, the arm moves
 ./pipeline/pipeline locate                       # ~5 min, the arm moves; skip it (eye_in_hand)
                                                  # if the board has not moved since calibrate
+./pipeline/pipeline grasp --hole round_c3mm      # closes the hand on the round peg (seat it in the V first)
 ./pipeline/pipeline check --hole round_c3mm      # dry run: prints the target, no motion
 ./pipeline/pipeline probe --hole round_c3mm      # moves the held round peg's tip onto the hole
 ```
@@ -133,10 +134,27 @@ Measures the board where it currently lies. Run it after every board move.
 Output: `sessions/<name>/board_pose.json` holds `T_base_board`. The board
 origin is the centre of its bottom face, and the top surface is at z = 25 mm.
 
+### `grasp`
+
+`grasp --hole NAME` closes the Franka Hand on the peg of that hole's shape: hold
+the peg in the V-block, then run it. It sends `franka_gripper`'s grasp action
+with the peg's width from `config/grasps.yaml` and succeeds when the fingers stop
+within `--epsilon MM` (default 1 mm) of that width; otherwise the peg is not
+seated in the V. The hand keeps squeezing with `--force N` (default 20 N) until
+it is released:
+
+```bash
+rostopic pub -1 /franka_gripper/move/goal franka_gripper/MoveActionGoal "goal: {width: 0.03, speed: 0.05}"
+```
+
+Do not run `/franka_gripper/homing` while holding a peg: homing closes and
+reopens the fingers fully. `grasp` moves only the fingers, never the arm.
+
 ### `check` / `probe`
 
 `check --hole NAME` validates the target and IK without moving. `probe --hole NAME`
-approaches 15 cm above the hole with the peg, then descends in guarded steps:
+approaches `probe.approach_height_m` above the hole with the peg
+(`board_manipulation.yaml`), then descends in guarded steps:
 
 * Enter approves the approach.
 * Enter during the descent stops it.
@@ -228,6 +246,7 @@ edit that copy; to change future sessions, edit the template.
 | `board_pipeline/panda.py` | Panda DH kinematics and IK |
 | `ros_nodes/grab_azure_rgbd.py` | single RGB-D frame grabber (runs in the container) |
 | `board_pipeline/grasp.py` | held peg: TCP pose and tool tip that put it on a hole |
+| `src/panda_calibration/panda_calibration/gripper.py` | `grasp_peg`: grasp action client behind `pipeline grasp` (runs in the container) |
 | `config/` | settings template, hole and grasp tables, look pose, prior hand-eye, calibration poses |
 
 ## Troubleshooting

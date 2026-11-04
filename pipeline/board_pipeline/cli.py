@@ -157,12 +157,27 @@ def cmd_probe(cfg: Config, args) -> None:
         print(f"\nlooks right? `pipeline probe --hole {args.hole}` moves the arm")
 
 
+def cmd_grasp(cfg: Config, args) -> None:
+    # The session's config snapshot if there is one, else the template: the
+    # grasp width only needs holes.yaml and grasps.yaml, not a board pose.
+    if args.session or Session.current_link(cfg).is_symlink():
+        cfg = Session.open(cfg, args.session).cfg
+    holes = _holes(cfg)
+    if args.hole not in holes:
+        raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
+    tool = grasp.hole_tool(cfg, holes[args.hole], args.hole)
+    print(f"closing the hand on the {tool.shape} peg: width {tool.grasp_width_mm:.2f} mm "
+          f"+-{args.epsilon:g} mm, force {args.force:g} N")
+    ros.rosrun(cfg, "panda_calibration", "grasp_peg", "--width", tool.grasp_width_mm / 1000.0,
+               "--epsilon", args.epsilon / 1000.0, "--force", args.force)
+
+
 # ---------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pipeline",
         description="Camera calibration, board localisation and hole probing for the Franka Panda.",
-        epilog="Run on the host. Typical run: new -> calibrate -> locate -> check -> probe "
+        epilog="Run on the host. Typical run: new -> calibrate -> locate -> grasp -> check -> probe "
                "(robot and cameras launched by hand in the container)")
     parser.add_argument("--session", help="session to use instead of the current one")
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -202,6 +217,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--height", type=float, default=0.0, metavar="MM",
                        help="peg tip height above the board surface, mm (default 0)")
         p.set_defaults(func=cmd_probe)
+
+    p = sub.add_parser("grasp", help="close the hand on the peg for a hole (width from config/grasps.yaml)")
+    p.add_argument("--hole", required=True, help="e.g. round_c1mm; `pipeline holes` lists them")
+    p.add_argument("--force", type=float, default=20.0, metavar="N",
+                   help="grip force, N (default 20; the Franka Hand allows 70 continuously)")
+    p.add_argument("--epsilon", type=float, default=1.0, metavar="MM",
+                   help="accepted deviation from the grasp width, mm (default 1)")
+    p.set_defaults(func=cmd_grasp)
     return parser
 
 

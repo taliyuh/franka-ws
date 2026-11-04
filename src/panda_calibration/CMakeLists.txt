@@ -12,6 +12,7 @@ catkin_install_python(PROGRAMS
   scripts/solve_handeye
   scripts/solve_joint_handeye
   scripts/probe_board
+  scripts/grasp_peg
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 install(DIRECTORY config launch
