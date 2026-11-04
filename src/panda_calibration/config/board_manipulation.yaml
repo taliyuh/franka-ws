@@ -23,7 +23,9 @@ probe:
   # TCP +Z point toward board -Z. `pipeline check/probe` replace it per hole: the
   # held peg is turned to the hole's yaw (by a multiple of its symmetry), and
   # only the yaw of this value is kept, to choose among the equivalent turns.
-  tcp_orientation_board_rpy: [3.141592653589793, 0.0, 0.0]
+  # Yaw -90 deg keeps joint 7 mid-range at the board; yaw 0 needed j7 = -2.85
+  # rad against its -2.897 limit (joint_motion_generator_position_limits_violation).
+  tcp_orientation_board_rpy: [3.141592653589793, 0.0, -1.5707963267948966]
 
 
   # Vector from panda_hand_tcp origin to the tool tip, expressed in TCP axes; the

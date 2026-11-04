@@ -115,7 +115,9 @@ motion:
                             # trusted, e.g. a constant offset in simulation)
   max_position_error: 0.06  # rad; legacy joint-space settling gate
   # Final Cartesian target tolerance checked against the measured Franka TCP.
-  max_cartesian_position_error_m: 0.0001
+  # 0.2 mm: at 0.1 mm (the Panda's rated repeatability) the corrections stalled
+  # at ~0.12 mm and aborted descents (2026-11-04).
+  max_cartesian_position_error_m: 0.0002
   # atan2(0.0001, 0.125): 0.1 mm lateral error at the user's 125 mm tool length.
   max_cartesian_rotation_error_rad: 0.000799999829333
   # The arm can settle with a small repeatable load/model residual. Retry only
