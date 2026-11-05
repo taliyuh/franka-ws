@@ -62,7 +62,7 @@ def hole_tool(cfg, hole: dict, name: str) -> Tool:
         raise PipelineError(f"{source} has no grasp for {name} ({hole['shape']}); "
                             "regenerate it with pipeline/tools/extract_grasps.py") from error
     tcp = shape["tcp"]
-    r_peg_tcp = _rz(math.radians(tcp["yaw_deg"])) @ FLIP
+    r_peg_tcp = _rz(math.radians(tcp["yaw_deg"]+180.0)) @ FLIP
     t_peg_tcp = np.array([tcp["x_m"], tcp["y_m"], tcp["z_m"]])
 
     # Turn the peg about its axis by the multiple of its symmetry period (any
