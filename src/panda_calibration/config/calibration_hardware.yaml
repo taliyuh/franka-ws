@@ -105,8 +105,10 @@ motion:
   # end effector (Franka Hand -> identical to panda_hand_tcp), rather than
   # nominal-URDF FK. The tools verify that once at startup. Its header has no
   # frame_id, so the frame is stated here.
-  measured_tcp_pose_topic: /franka_state_controller/franka_states
-  measured_tcp_pose_frame: panda_link0
+  # DISABLED while the controller's NE_T_EE is offset (42 mm from Franka Hand);
+  # restore once the Desk end effector is back to the Franka Hand.
+  # measured_tcp_pose_topic: /franka_state_controller/franka_states
+  # measured_tcp_pose_frame: panda_link0
   max_joint_speed: 0.4      # rad/s, before --speed-scale
   min_duration: 2.0         # s, floor on any point-to-point move
   goal_time_tolerance: 0.5  # s the controller may overrun the trajectory end
