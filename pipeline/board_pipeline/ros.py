@@ -126,6 +126,20 @@ def robot_mode(cfg: Config) -> int | None:
     return int(echoed[0]) if echoed and echoed[0].isdigit() else None
 
 
+ARM_JOINT_STATES = "/franka_state_controller/joint_states"
+
+
+def current_joints(cfg: Config) -> list[float] | None:
+    """The arm's 7 measured joint angles (panda_joint1..7), None if no state arrives."""
+    try:
+        echoed = output(cfg, ["rostopic", "echo", "-n1", ARM_JOINT_STATES], timeout=5.0)
+        state = yaml.safe_load(echoed.split("\n---")[0]) or {}
+        positions = dict(zip(state["name"], state["position"]))
+        return [float(positions[f"panda_joint{i}"]) for i in range(1, 8)]
+    except (PipelineError, yaml.YAMLError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def motion_errors(cfg: Config) -> list[str]:
     """Names of the flags set in FrankaState last_motion_errors."""
     listing = output(cfg, ["rostopic", "echo", "-n1", f"{FRANKA_STATES}/last_motion_errors"],

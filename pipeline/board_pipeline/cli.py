@@ -128,13 +128,37 @@ def cmd_holes(cfg: Config, args) -> None:
         print(line)
 
 
+def _print_turns(tool, candidates, start) -> None:
+    """One line per symmetric turn of the peg: joint 7 at the hole, the chosen one marked."""
+    shape_turns = "any turn" if tool.period == 0 else \
+        "no turn" if len(candidates) == 1 else f"turns every {math.degrees(tool.period):g} deg"
+    origin = f"joint 7 now {start[6]:+.2f} rad" if start is not None else \
+        "no robot state, keeping joint 7 near mid-range"
+    print(f"{tool.shape} peg: {shape_turns}; {origin}")
+    if tool.period == 0:
+        candidates = [c for c in candidates if c[0].turn == tool.turn]
+    for option, q in candidates:
+        mark = "->" if option.turn == tool.turn else "  "
+        j7 = "unreachable" if q is None else \
+            f"j7 {q[6]:+.2f} rad ({grasp.wrist_margin(q[6]):.2f} rad from its limit)" \
+            + ("" if start is None else f", turn {q[6] - start[6]:+.2f} rad")
+        print(f"  {mark} turn {math.degrees(option.turn):+7.1f} deg: {j7}")
+
+
 def cmd_probe(cfg: Config, args) -> None:
     session = Session.open(cfg, args.session)
     holes = _holes(session.cfg)
     if args.hole not in holes:
         raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
     hole = holes[args.hole]
-    tool = grasp.hole_tool(session.cfg, hole, args.hole)
+    board = np.asarray(json.loads(session.require(BOARD_POSE, "run `pipeline locate` first")
+                                  .read_text())["T_base_board"])
+    # The wrist turn is measured from where the arm stands now (probe_board's
+    # IK starts there); without a robot state, joint 7 is kept near mid-range.
+    start = ros.current_joints(session.cfg)
+    tool, candidates = grasp.choose_turn(session.cfg, hole, args.hole, board,
+                                         None if start is None else np.asarray(start))
+    _print_turns(tool, candidates, start)
     print(f"held peg: {tool.shape} in the V-block fingers (grasp width {tool.grasp_width_mm:.2f} mm), "
           f"peg yaw {math.degrees(tool.peg_yaw):.2f} deg on the board, "
           f"tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP")

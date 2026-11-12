@@ -630,13 +630,18 @@ def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
     stage = json.loads(board_file.read_text()).get("source", {}).get("stage", "locate")
     seed_joints = session.step_dir(stage, "seed_fit") / "view" / "joints.json"
     seed = np.asarray(json.loads(seed_joints.read_text())["measured_joints"])
-    # A local IK from one seed can stall; try the look pose, READY, and both
-    # with joint 7 turned, and keep the solution nearest the look pose.
-    seeds = [np.r_[base[:6], base[6] + turn] for base in (seed, panda.READY)
-             for turn in (0.0, -math.pi / 2, math.pi / 2, -math.pi, math.pi)]
+    # The correction is evaluated where the arm will be: at the joints
+    # grasp.choose_turn predicted for this peg turn, when it ran. A local IK
+    # from one seed can stall; also try the look pose, READY, and both with
+    # joint 7 turned, and keep the solution nearest the predicted joints (else
+    # the look pose).
+    near = tool.joints if tool.joints is not None else seed
+    seeds = ([near] if tool.joints is not None else []) \
+        + [np.r_[base[:6], base[6] + turn] for base in (seed, panda.READY)
+           for turn in (0.0, -math.pi / 2, math.pi / 2, -math.pi, math.pi)]
     solutions = [panda.ik(target, np.clip(s, panda.LOWER, panda.UPPER)) for s in seeds]
     good = [q for q, r in solutions if r < 1e-4]
-    q_true, residual = (min(good, key=lambda q: np.abs(q - seed).max()), 0.0) if good \
+    q_true, residual = (min(good, key=lambda q: np.abs(q - near).max()), 0.0) if good \
         else min(solutions, key=lambda t: t[1])
     if residual > 1e-4:
         raise PipelineError(f"no IK solution over {name} (residual {residual:.2e})")

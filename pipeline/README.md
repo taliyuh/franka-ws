@@ -178,9 +178,18 @@ shape, seated in the V with its top against the roof (gripper width as in
 | rectangle | +0.5, +15.5 mm                    | 39 mm             | 180°          |
 | L         | +4.5, +17.0 mm                    | 39 mm             | none          |
 
-The peg frame is lined up with the hole frame. Of the allowed turns,
-the one that keeps the hand closest to the yaw of `tcp_orientation_board_rpy`
-is used. The resulting tool (TCP orientation and TCP-to-peg-tip vector) is
+The peg frame is lined up with the hole frame, turned about the peg axis by
+one of the allowed turns: they all fit the hole, but each puts the wrist
+(joint 7) somewhere else. `check`/`probe` solve the IK for every allowed turn
+(every 10° for the round peg) and use the one that turns joint 7 least from
+where the arm stands now, among those that keep it at least 0.35 rad
+(`WRIST_MARGIN_RAD` in `grasp.py`) inside its ±2.897 rad limits. A hexagon
+peg therefore never turns the wrist more than about 30° either way to line
+up. Without a robot state (robot launch not running), joint 7 is kept as
+close to mid-range as possible. The candidates are printed, the chosen one
+marked `->`. The L has no other turn: if its one placement leaves joint 7
+too close to a limit, `check` warns, and turning the board on the table is
+the fix. The resulting tool (TCP orientation and TCP-to-peg-tip vector) is
 written to `targets/<hole>_tool.yaml` and replaces the pen settings of
 `board_manipulation.yaml` for that hole. The offsets are nominal CAD values
 from `grasp_poses_v2.json`, registered onto the hole-frame convention by
