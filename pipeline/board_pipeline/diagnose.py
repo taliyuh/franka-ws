@@ -524,13 +524,17 @@ def _target(session: Session, holes: dict, name: str, tip_from: str | None):
     """(tool, tip source, true-frame tip target, nominal-frame board pose) for one hole."""
     if name not in holes:
         raise PipelineError(f"unknown hole {name!r}; `pipeline holes` lists them")
-    tool = grasp.hole_tool(session.cfg, holes[name], name)
+    board, _ = _board(session)
+    # The same peg turn as `pipeline probe` would pick from here, so the target
+    # (and its joint-offset correction) is the one the probe drives to.
+    start = ros.current_joints(session.cfg)
+    tool, _ = grasp.choose_turn(session.cfg, holes[name], name, board,
+                                None if start is None else np.asarray(start))
     source = "CAD"
     if tip_from:
         tool, source = grasp.apply_pivot_tip(tool, grasp.load_pivot_tip(ros.host_path(session.cfg, tip_from)))
     nominal_file = eye_in_hand.hole_target(session, session.cfg, holes[name], name, tool)
     nominal = np.asarray(json.loads(nominal_file.read_text())["T_base_board"])
-    board, _ = _board(session)
     return tool, source, (board @ np.r_[tool.point, SURFACE_Z, 1.0])[:3], nominal
 
 

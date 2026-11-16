@@ -6,6 +6,7 @@ log/
 # ------------------------------------------------------------------- data
 # Pipeline sessions: 4K captures, fits, calibrations. Measurements, not code.
 sessions/
+repeatability/
 
 # ------------------------------------------------------- upstream packages
 # Panda / Noetic: franka_ros, panda_moveit_config, the Azure Kinect and Orbbec

@@ -131,13 +131,39 @@ def cmd_holes(cfg: Config, args) -> None:
         print(line)
 
 
+def _print_turns(tool, candidates, start) -> None:
+    """One line per symmetric turn of the peg: joint 7 at the hole, the chosen one marked."""
+    shape_turns = "any turn" if tool.period == 0 else \
+        "no turn" if len(candidates) == 1 else f"turns every {math.degrees(tool.period):g} deg"
+    origin = f"joint 7 now {start[6]:+.2f} rad" if start is not None else \
+        "no robot state, keeping joint 7 near mid-range"
+    print(f"{tool.shape} peg: {shape_turns}; {origin}")
+    if tool.period == 0:
+        candidates = [c for c in candidates if c[0].turn == tool.turn]
+    for option, q in candidates:
+        mark = "->" if option.turn == tool.turn else "  "
+        j7 = "unreachable" if q is None else \
+            f"j7 {q[6]:+.2f} rad ({grasp.wrist_margin(q[6]):.2f} rad from its limit)" \
+            + ("" if start is None else f", turn {q[6] - start[6]:+.2f} rad")
+        print(f"  {mark} turn {math.degrees(option.turn):+7.1f} deg: {j7}")
+
+
 def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None, height_mm: float,
                   turn_deg: float = 0.0):
     """Write one hole's target and tool files; returns (tool, tip source, target file, probe_board argv)."""
     if name not in holes:
         raise PipelineError(f"unknown hole {name!r}; `pipeline holes` lists them")
     hole = holes[name]
-    tool = grasp.hole_tool(session.cfg, hole, name, turn_deg)
+    board = np.asarray(json.loads(session.require(BOARD_POSE, "run `pipeline locate` first")
+                                  .read_text())["T_base_board"])
+    # The wrist turn is measured from where the arm stands now (probe_board's
+    # IK starts there); without a robot state, joint 7 is kept near mid-range.
+    start = ros.current_joints(session.cfg)
+    tool, candidates = grasp.choose_turn(session.cfg, hole, name, board,
+                                         None if start is None else np.asarray(start))
+    _print_turns(tool, candidates, start)
+    if turn_deg:
+        tool = grasp.turn_further(session.cfg, hole, name, tool, board, turn_deg)
     tip_source = "CAD"
     if tip_from:
         tool, tip_source = grasp.apply_pivot_tip(
@@ -430,8 +456,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="use the peg tip measured by `rosrun panda_calibration pivot_calibration` "
                             "(only for the peg shape it was measured on) instead of the CAD tip")
         p.add_argument("--turn", type=float, default=0.0, metavar="DEG",
-                       help="turn the hand this much further about the peg axis (a multiple of the peg's "
-                            "symmetry; any angle for the round peg). `pipeline diag 3` is the measured version")
+                       help="turn the hand this much further about the peg axis than the automatic choice "
+                            "(a multiple of the peg's symmetry; any angle for the round peg). "
+                            "`pipeline diag 3` is the measured version")
         if command == "tip":
             p.add_argument("--watch", action="store_true",
                            help="keep printing twice a second until Ctrl-C (also while hand-guiding)")
