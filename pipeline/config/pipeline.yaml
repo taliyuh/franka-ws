@@ -51,6 +51,10 @@ eye_in_hand:
   max_mad_px: 1.0            # reject board fits with a worse median rim residual
   calibrate:
     views: 30
+    # Extra views from the robot's side of the board (camera between the base and
+    # the board, looking away from the robot), visited from READY before the
+    # look pose: the views above all look back toward the base. 0 turns them off.
+    robot_side_views: 4
     bundle_free: [fx, fy, cx, cy]     # intrinsics refined by bundle adjustment
     model: ["off", "scale", "sag"]    # chain error terms (quoted: YAML reads off as false), see eye_in_hand.chain_model
   locate:

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Pivot calibration of the tool tip held in the Franka Hand."""
+import sys
+
+from panda_calibration.pivot_calibration import main
+
+sys.exit(main())

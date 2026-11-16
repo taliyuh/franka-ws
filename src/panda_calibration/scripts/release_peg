@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Open the Franka Hand to let go of the held peg (franka_gripper move action)."""
+import sys
+
+from panda_calibration.gripper import release_main
+
+sys.exit(release_main())

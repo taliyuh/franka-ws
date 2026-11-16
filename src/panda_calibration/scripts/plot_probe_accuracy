@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Figure, table and summary of a `pipeline accuracy` run (target vs measured at each probed hole)."""
+import sys
+
+from panda_calibration.probe_accuracy import main
+
+sys.exit(main())

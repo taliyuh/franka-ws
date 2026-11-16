@@ -6,6 +6,11 @@ for this program to consume. Every approach and descent move is sent to
 franka_ros' ``position_joint_trajectory_controller`` (libfranka joint position
 interface) as a single-point quintic; an effort-mode trajectory controller is
 not accepted for probing, because it settles with a load-dependent residual.
+
+With ``--record FILE`` (``pipeline accuracy``) every attempt of every move is
+written to FILE: the commanded TCP pose and joints and where the arm settled
+(see probe_accuracy.py). The arm then also holds at the bottom when the descent
+reaches the target, for photos, and asks for a note before it retracts.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
 
+from . import probe_accuracy
 from .capture_node import robot_description
 from .context import build_chain, default_config_path, load_config
 from .board_pose import (
@@ -63,6 +69,19 @@ def compensate_pose_for_measured_error(command: np.ndarray,
     return corrected
 
 
+def pen_tip_report(tcp_pose: np.ndarray, pen_tip_offset, board_transform: np.ndarray,
+                   target_point) -> str:
+    """Where the pen tip is (TCP pose + TCP->tip offset) and how far from the target, in board axes."""
+    tip = tcp_pose[:3, :3] @ np.asarray(pen_tip_offset, dtype=float) + tcp_pose[:3, 3]
+    rel = board_transform[:3, :3].T @ (tip - np.asarray(target_point, dtype=float)[:3])
+    rel = np.round(rel, 5) + 0.0  # to the printed 0.01 mm, without -0.00
+    height = 'above' if rel[2] >= 0 else 'below'
+    return (f'pen tip in base [m]: {np.round(tip, 5).tolist()}; from the target (board axes): '
+            f'x {rel[0] * 1000:+.2f}, y {rel[1] * 1000:+.2f} mm '
+            f'({np.hypot(rel[0], rel[1]) * 1000:.2f} mm beside), '
+            f'{abs(rel[2]) * 1000:.2f} mm {height} it')
+
+
 def validate_probe_motion_config(config: dict) -> None:
     """Require the joint *position* trajectory controller for real board probing.
 
@@ -97,6 +116,7 @@ class BoardManipulation:
         self.local_chain = None
         self.kinematic_chain = None
         self.use_moveit_ik = False
+        self.recorder = None   # probe_accuracy.Recorder with --record
 
     def shutdown(self) -> None:
         self.driver.shutdown()
@@ -112,7 +132,10 @@ class BoardManipulation:
             return False
 
     def wait_for_robot(self) -> bool:
-        if not self.args.dry_run:
+        # --where only reads the robot state, so it also works with the
+        # controller stopped (hand guiding).
+        moving = not (self.args.dry_run or self.args.where)
+        if moving:
             motion_action = self.config['motion']['controller_action']
             rospy.loginfo(f'waiting for trajectory action {motion_action}')
             if not self.driver.wait_for_controller(timeout=10.0):
@@ -142,7 +165,7 @@ class BoardManipulation:
             self.local_chain = self.kinematic_chain
         frame_problem = self.driver.check_measured_tcp_frame(self.kinematic_chain)
         if frame_problem:
-            if not self.args.dry_run:
+            if moving:
                 rospy.logerr(frame_problem)
                 return False
             rospy.logwarn(frame_problem)
@@ -175,6 +198,11 @@ class BoardManipulation:
             quaternion_to_matrix([rotation.x, rotation.y, rotation.z, rotation.w]),
             [translation.x, translation.y, translation.z],
         )
+
+    def measured_tcp(self, base_frame: str) -> np.ndarray:
+        """The robot's measured TCP pose (O_T_EE), or the TF one without it."""
+        pose = self.driver.last_measured_tcp_pose
+        return pose if pose is not None else self.current_tcp_pose(base_frame)
 
     def solve_ik(self, pose: np.ndarray, frame_id: str) -> list[float]:
         if not self.use_moveit_ik:
@@ -225,8 +253,13 @@ class BoardManipulation:
             pose: np.ndarray,
             frame_id: str,
             speed_scale: float,
-            pose_validator: Callable[[np.ndarray], None] | None = None) -> None:
-        """Move to a Cartesian pose, correcting only a bounded measured residual."""
+            pose_validator: Callable[[np.ndarray], None] | None = None,
+            record: dict | None = None) -> None:
+        """Move to a Cartesian pose, correcting only a bounded measured residual.
+
+        *record* names the move for the recorder (``phase`` and, while descending,
+        ``depth_mm``); every attempt is then recorded, the uncorrected first one too.
+        """
         motion = self.config['motion']
         maximum_translation_error = float(motion['max_cartesian_position_error_m'])
         maximum_rotation_error = float(motion['max_cartesian_rotation_error_rad'])
@@ -237,6 +270,8 @@ class BoardManipulation:
             motion.get('cartesian_correction_window_rad', maximum_rotation_error))
         desired_pose = pose.copy()
         command_pose = desired_pose.copy()
+        move = (self.recorder.start_move(**record)
+                if self.recorder is not None and record is not None and not self.args.dry_run else None)
 
         for attempt in range(correction_attempts + 1):
             if pose_validator is not None:
@@ -266,6 +301,10 @@ class BoardManipulation:
                 f'{rotation_error:.6f} rad'
                 + (f' (correction {attempt}/{correction_attempts})'
                    if correction_attempts else ''))
+            if move is not None:
+                entry = self.recorder.attempt(move, attempt + 1, desired_pose, command_pose, joints,
+                                              self.driver.positions, actual_pose, ok, message)
+                rospy.loginfo(probe_accuracy.describe(record['phase'], entry))
 
             if ok and (translation_error <= maximum_translation_error
                        and rotation_error <= maximum_rotation_error):
@@ -301,13 +340,19 @@ class BoardManipulation:
         raise RuntimeError('Cartesian correction loop ended unexpectedly')
 
 
-def wait_for_enter(stop_event: threading.Event) -> None:
-    """Set *stop_event* when the operator presses Enter during descent."""
+def wait_for_enter(stop_event: threading.Event, typed: list | None = None) -> None:
+    """Set *stop_event* when the operator presses Enter during descent; keep the line in *typed*."""
     try:
-        input('Descending. Press Enter to stop at the current height... ')
+        line = input('Descending. Press Enter to stop at the current height... ')
     except EOFError:
         return
+    if typed is not None:
+        typed.append(line)
     stop_event.set()
+
+
+PHOTO_PROMPT = ('Take the photos, then type what you see (optional, e.g. "in", "touches the +x edge") '
+                'and press Enter to retract. Ctrl-C leaves the arm here and exits.')
 
 
 def load_manipulation_config(path: str | None) -> dict:
@@ -334,7 +379,21 @@ def main(argv=None) -> int:
                         help='validate artifact and IK without sending trajectories')
     parser.add_argument('--yes', action='store_true',
                         help='skip the approach confirmation (never skip physical e-stop checks)')
+    parser.add_argument('--where', action='store_true',
+                        help='print where the pen tip is relative to the target and exit; no motion, '
+                             'works with the controller stopped (hand guiding)')
+    parser.add_argument('--watch', action='store_true',
+                        help='with --where: keep printing twice a second until Ctrl-C')
+    parser.add_argument('--record', metavar='FILE',
+                        help='write the commanded and measured TCP pose and joints of every move to FILE '
+                             '(YAML, see probe_accuracy.py); the arm then also holds at the bottom when '
+                             'the descent reaches the target, for photos, and asks for a note before '
+                             'it retracts')
     args = parser.parse_args(argv if argv is not None else rospy.myargv(sys.argv)[1:])
+    if args.watch and not args.where:
+        parser.error('--watch needs --where')
+    if args.record and (args.dry_run or args.where):
+        parser.error('--record needs a probe that moves (not --dry-run or --where)')
 
     try:
         base_frame, board_transform, surface_z = load_board_pose(args.board_pose)
@@ -371,14 +430,33 @@ def main(argv=None) -> int:
     print(f'TCP target in base [m]: {target[:3, 3].tolist()}')
     if args.dry_run:
         print('Dry-run: no trajectory goals will be sent.')
-    elif not args.yes:
+    elif not args.yes and not args.where:
         input('Press Enter to approach the point, or Ctrl-C to abort... ')
 
     rospy.init_node('board_manipulation', anonymous=True, disable_signals=True)
     node = BoardManipulation(config, args)
+
+    def pen_tip() -> str:
+        return pen_tip_report(node.measured_tcp(base_frame), pen_tip_offset,
+                              board_transform, board_point)
+
     try:
         if not node.wait_for_robot():
             return 1
+        if args.where:
+            while True:
+                line = f'current {pen_tip()}'
+                age = time.monotonic() - node.driver.state_received_monotonic_s
+                if age > 1.0:
+                    line += f' (no robot state for {age:.0f} s)'
+                print(line, flush=True)
+                if not args.watch:
+                    return 0
+                time.sleep(0.5)  # the subscriber threads keep the measured pose fresh
+        print(f'current {pen_tip()}', flush=True)
+        if args.record:
+            node.recorder = probe_accuracy.Recorder(
+                args.record, base_frame, board_transform, board_point, target, pen_tip_offset)
         configured_staging_z = probe.get('staging_z_m')
         if args.staging_z is not None:
             staging_z = float(args.staging_z)
@@ -428,7 +506,9 @@ def main(argv=None) -> int:
             f'{staging_clearance * 1000:.1f} mm)')
         node.move_cartesian_pose(
             staging, base_frame, float(probe['approach_speed_scale']),
-            pose_validator=validate_pen_clearance)
+            pose_validator=validate_pen_clearance, record={'phase': 'approach'})
+        if not args.dry_run:
+            rospy.loginfo(f'at the approach pose; {pen_tip()}')
         if args.dry_run:
             descent_target = target.copy()
             node.move_cartesian_pose(
@@ -441,7 +521,9 @@ def main(argv=None) -> int:
             f'{float(probe["descent_speed_scale"]):.3f} speed scale '
             f'(limit {descent_limit * 1000:.1f} mm)')
         stop_event = threading.Event()
-        threading.Thread(target=wait_for_enter, args=(stop_event,), daemon=True).start()
+        typed = []
+        reader = threading.Thread(target=wait_for_enter, args=(stop_event, typed), daemon=True)
+        reader.start()
         descended = 0.0
         while descended < descent_limit and not stop_event.is_set():
             step = min(segment, descent_limit - descended)
@@ -458,11 +540,14 @@ def main(argv=None) -> int:
                 next_pose,
                 base_frame,
                 float(probe['descent_speed_scale']),
-                pose_validator=validate_pen_clearance)
+                pose_validator=validate_pen_clearance,
+                record={'phase': 'descent', 'depth_mm': (descended + step) * 1000})
             descended += step
-            rospy.loginfo(f'descended {descended * 1000:.1f} mm')
+            rospy.loginfo(f'descended {descended * 1000:.1f} mm; {pen_tip()}')
 
-        if not stop_event.is_set():
+        recorder = node.recorder
+        reached = not stop_event.is_set()
+        if reached and recorder is None:
             rospy.logerr('maximum descent reached without an operator stop')
             rospy.logwarn('retracting to the configured approach pose')
             node.move_cartesian_pose(
@@ -470,18 +555,42 @@ def main(argv=None) -> int:
                 base_frame,
                 float(probe['approach_speed_scale']),
                 pose_validator=validate_pen_clearance)
+            rospy.loginfo(f'retracted; {pen_tip()}')
             return 1
-        rospy.loginfo(f'stopped after {descended * 1000:.1f} mm; holding position')
-        input('Press Enter to retract along the approach path, or Ctrl-C to hold... ')
+        rospy.loginfo(f'{"reached the target" if reached else "stopped"} after {descended * 1000:.1f} mm; '
+                      f'holding position; {pen_tip()}')
+        if recorder is None:
+            input('Press Enter to retract along the approach path, or Ctrl-C to hold... ')
+        else:
+            recorder.hold(probe_accuracy.TARGET_REACHED if reached else probe_accuracy.OPERATOR_STOP,
+                          descended * 1000, node.driver.positions, node.measured_tcp(base_frame))
+            print(f"\n>>> {recorder.data['hole']}: holding for photos, {descended * 1000:.1f} mm down, "
+                  f"{time.strftime('%H:%M:%S')} <<<\n{PHOTO_PROMPT}", flush=True)
+            if reached:
+                # The descent's Enter reader still waits for a line: it takes the note.
+                while reader.is_alive():
+                    reader.join(0.2)
+                note = typed[0] if typed else ''
+            else:
+                note = input('> ')
+            recorder.note(note)
         node.move_cartesian_pose(
             staging,
             base_frame,
             float(probe['approach_speed_scale']),
-            pose_validator=validate_pen_clearance)
+            pose_validator=validate_pen_clearance,
+            record={'phase': 'retract'})
+        rospy.loginfo(f'retracted; {pen_tip()}')
+        if recorder is not None:
+            recorder.finish('done')
         return 0
     except KeyboardInterrupt:
-        return 130
+        if node.recorder is not None:
+            node.recorder.finish('interrupted', 'Ctrl-C')
+        return 0 if args.where else 130
     except RuntimeError as error:
+        if node.recorder is not None:
+            node.recorder.finish('aborted', str(error))
         if not rospy.is_shutdown():
             rospy.logerr(f'aborted: {error}')
         else:

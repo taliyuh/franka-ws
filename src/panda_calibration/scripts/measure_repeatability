@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Measure how well the arm returns to taught joint angles, without compensation."""
+import sys
+
+from panda_calibration.repeatability import main
+
+sys.exit(main())

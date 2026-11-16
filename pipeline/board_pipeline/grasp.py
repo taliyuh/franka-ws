@@ -10,12 +10,16 @@ to the configured tcp_orientation_board_rpy), and the TCP follows:
 
 probe_board takes a tool as an orientation in the board frame plus a TCP ->
 tip vector in TCP axes; `write_manipulation_config` writes both for one hole.
+
+The tip comes from the CAD grasp unless `pipeline check/probe --tip-from FILE`
+passes a pivot_calibration result measured on the same peg shape;
+`apply_pivot_tip` swaps it in after comparing it with the CAD tip.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -51,10 +55,25 @@ class Tool:
         return target
 
 
-def hole_tool(cfg, hole: dict, name: str) -> Tool:
+def _grasps(cfg) -> tuple[str, dict]:
     # Sessions created before the fingers were swapped have no `grasps` entry.
     source = cfg.data.get("grasps", DEFAULT_GRASPS)
-    grasps = load_yaml(cfg.path(source))
+    return source, load_yaml(cfg.path(source))
+
+
+def grasp_width_mm(cfg, shape: str) -> float:
+    """Finger width with the peg of this shape seated in the V-block, mm."""
+    source, grasps = _grasps(cfg)
+    shapes = grasps["shapes"]
+    if shape not in shapes:
+        raise PipelineError(f"no peg shape {shape!r} in {source}; the shapes are {', '.join(shapes)}")
+    return float(shapes[shape]["grasp_width_mm"])
+
+
+def hole_tool(cfg, hole: dict, name: str, extra_turn_deg: float = 0.0) -> Tool:
+    """The held peg on this hole; extra_turn_deg turns the hand further about the peg axis
+    (a multiple of the peg's symmetry period; `pipeline diag 3` / `--turn`)."""
+    source, grasps = _grasps(cfg)
     try:
         shape = grasps["shapes"][hole["shape"]]
         centre = grasps["holes"][name]
@@ -78,6 +97,12 @@ def hole_tool(cfg, hole: dict, name: str) -> Tool:
     period = math.radians(shape["yaw_period_deg"])
     if period > 0:
         turn = period * round(turn / period)
+    if extra_turn_deg:
+        extra = math.radians(extra_turn_deg)
+        if period > 0 and abs(math.remainder(extra, period)) > 1e-6:
+            raise PipelineError(f"the {hole['shape']} peg only turns by multiples of "
+                                f"{shape['yaw_period_deg']:g} deg, not {extra_turn_deg:g}")
+        turn += extra
     peg_yaw = hole_yaw + turn
 
     point = np.array([hole["x_m"], hole["y_m"]]) \
@@ -97,3 +122,48 @@ def write_manipulation_config(cfg, tool: Tool, out: Path) -> Path:
     out.write_text(f"# {tool.shape} peg in the V-block fingers; written by `pipeline check/probe`\n"
                    + yaml.safe_dump(data, sort_keys=False))
     return out
+
+
+# A measured tip further than this from the CAD one, in distance from the TCP
+# axis or along it, is a wrong file or peg rather than a CAD error.
+PIVOT_MAX_DEVIATION_M = 0.005
+
+
+@dataclass(frozen=True)
+class PivotTip:
+    shape: str
+    tip: np.ndarray         # TCP -> tool tip, TCP axes, m (pivot_calibration's tip_in_tcp_m)
+    path: Path
+
+
+def load_pivot_tip(path: Path) -> PivotTip:
+    data = load_yaml(path)
+    if data.get("frame") != "panda_hand_tcp" or "tip_in_tcp_m" not in data:
+        raise PipelineError(f"{path} is not a pivot_calibration result")
+    # Results from before the shape was recorded were all measured with the round pointer.
+    return PivotTip(shape=data.get("shape", "round"),
+                    tip=np.asarray(data["tip_in_tcp_m"], dtype=float), path=Path(path))
+
+
+def apply_pivot_tip(tool: Tool, pivot: PivotTip) -> tuple[Tool, str]:
+    """The tool with the measured tip when it was measured on this peg shape, and where the tip came from."""
+    if pivot.shape != tool.shape:
+        return tool, f"CAD; {pivot.path.name} is for the {pivot.shape} peg"
+    cad, measured = tool.tip_offset, pivot.tip
+    # Compare in a way a turn about the TCP axis does not change: the grasp yaw
+    # is itself a CAD value the measurement may disagree with.
+    radius_cad, radius = np.linalg.norm(cad[:2]), np.linalg.norm(measured[:2])
+    if abs(radius - radius_cad) > PIVOT_MAX_DEVIATION_M or abs(measured[2] - cad[2]) > PIVOT_MAX_DEVIATION_M:
+        raise PipelineError(
+            f"{pivot.path.name}: tip {np.round(measured * 1e3, 2)} mm is {radius * 1e3:.1f} mm from the "
+            f"TCP axis and {measured[2] * 1e3:.1f} mm along it; the CAD {tool.shape} peg has "
+            f"{radius_cad * 1e3:.1f} and {cad[2] * 1e3:.1f} mm. Wrong file, or not the {tool.shape} peg?")
+    source = (f"measured, {pivot.path.name}; CAD {np.round(cad * 1e3, 2)} mm, "
+              f"{np.linalg.norm(measured - cad) * 1e3:.2f} mm apart")
+    if radius > 0.001 and radius_cad > 0.001:
+        turn = math.degrees(abs(math.remainder(
+            math.atan2(measured[1], measured[0]) - math.atan2(cad[1], cad[0]), 2 * math.pi)))
+        if turn > 20.0:
+            source += (f"; the measured tip is turned {turn:.0f} deg about the TCP axis from the CAD "
+                       "one, so the grasp yaw in grasps.yaml / grasp.py looks off")
+    return replace(tool, tip_offset=measured), source

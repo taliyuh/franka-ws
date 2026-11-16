@@ -13,6 +13,10 @@ catkin_install_python(PROGRAMS
   scripts/solve_joint_handeye
   scripts/probe_board
   scripts/grasp_peg
+  scripts/release_peg
+  scripts/pivot_calibration
+  scripts/measure_repeatability
+  scripts/plot_probe_accuracy
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 install(DIRECTORY config launch

@@ -44,6 +44,11 @@ SURFACE_Z = 0.025
 POINTS = np.array([[sx * BOARD_HALF[0], sy * BOARD_HALF[1], SURFACE_Z, 1.0]
                    for sx in (-1, 1) for sy in (-1, 1)] + [[0, 0, SURFACE_Z, 1.0]]).T
 GRAVITY = np.array([0, 0, -1.0])
+# TEST HACK (2026-11-16, to try trajectories while the -x error is investigated):
+# `calibrate` writes board_pose.json with the board moved by this in panda_link0
+# (-x: toward the base). calibration.json keeps the fitted pose unshifted, and
+# `locate` does not shift. Set to 0.0 to turn it off.
+CALIBRATE_BOARD_SHIFT_BASE_M = np.array([-0.003, 0.0, 0.0])
 
 
 # ================================================================ chain model
@@ -144,12 +149,132 @@ class Calibration:
 
 
 # ================================================================ view plans
-def plan_views(q0, base_board, x, K, width, height, count, p):
+# Views from the robot's side of the board: the camera between the base and the
+# board, looking away from the robot. The look pose sees the board from its far
+# side and the views of plan_views stay within box_deg of it, so they all look
+# back toward the base, and a bias along that direction does not average out.
+# Oblique views constrain the camera distance, the focal length and the scale
+# term far better than frontal ones, and views from opposite sides cancel a bias
+# along the viewing direction. Past about 50 deg the rim edges are foreshortened
+# enough for the fit to suffer, so that is the top.
+ROBOT_SIDE_TILT_DEG = (30.0, 50.0)   # camera direction from the board normal
+ROBOT_SIDE_AZIMUTH_DEG = 80.0        # left and right of the direction from the board centre to the base
+# Joints 2-6 stay within ROBOT_SIDE_BOX_DEG of READY, joint 1 (turning the whole
+# arm about the base, for the left and right views) within ROBOT_SIDE_J1_DEG.
+ROBOT_SIDE_BOX_DEG = 40.0
+ROBOT_SIDE_J1_DEG = 80.0
+# The elbow folds far in these poses: the camera centre stays this far from the
+# base column and the upper arm (READY 0.37 m, the poses run so far >= 0.25 m).
+CAMERA_ARM_CLEARANCE_M = 0.20
+
+
+def _segment_distance(point, a, b) -> float:
+    t = np.clip((point - a) @ (b - a) / max((b - a) @ (b - a), 1e-12), 0.0, 1.0)
+    return float(np.linalg.norm(point - (a + t * (b - a))))
+
+
+def camera_arm_clearance(q, x) -> float:
+    """Camera centre to the base column and the upper arm (up to the elbow), m."""
+    origins = panda.frame_origins(q)
+    camera = (panda.fk(q, "panda_link6") @ x)[:3, 3]
+    chain = [np.zeros(3), origins[1], origins[2], origins[3]]
+    return min(_segment_distance(camera, a, b) for a, b in zip(chain, chain[1:]))
+
+
+def robot_side_views(count, centre, normal, base_board, x, visible, clear, segment_ok, p):
+    """Up to *count* joint poses that view the board from the robot's side.
+
+    Oblique (ROBOT_SIDE_TILT_DEG) and spread left to right (ROBOT_SIDE_AZIMUTH_DEG).
+    They stay near READY (ROBOT_SIDE_BOX_DEG, joint 1 ROBOT_SIDE_J1_DEG; joint 7
+    at READY's, it does not move the camera), keep CAMERA_ARM_CLEARANCE_M, and
+    form a chain READY -> views -> READY of clean paths: plan_views puts READY
+    between them and the look pose. Returns (poses, report lines).
+    """
+    rng = np.random.default_rng(p.seed + 1)
+    toward = -np.asarray(centre, float)          # board centre -> robot base, in the board plane
+    toward -= normal * (normal @ toward)
+    toward /= np.linalg.norm(toward)
+    side = np.cross(normal, toward)
+    ready = panda.READY
+    box = np.radians([ROBOT_SIDE_J1_DEG] + [ROBOT_SIDE_BOX_DEG] * 5 + [0.0])
+    lo = np.maximum(panda.LOWER + p.limit_margin, ready - box)
+    hi = np.minimum(panda.UPPER - p.limit_margin, ready + box)
+    # READY turned about the base toward each side gives IK a start for the side views.
+    seeds = [np.r_[ready[0] + turn, ready[1:]] for turn in np.radians([0, 35, -35, 70, -70])]
+    ready_camera = panda.fk(ready, "panda_link6") @ x
+
+    found = []   # (q, camera pose, tilt deg, azimuth deg)
+    for _ in range(4000):
+        tilt = math.radians(rng.uniform(*ROBOT_SIDE_TILT_DEG))
+        az = math.radians(rng.uniform(-ROBOT_SIDE_AZIMUTH_DEG, ROBOT_SIDE_AZIMUTH_DEG))
+        direction = math.cos(tilt) * normal + math.sin(tilt) * (math.cos(az) * toward + math.sin(az) * side)
+        cam_pos = centre + rng.uniform(p.min_dist, p.max_dist) * direction
+        z = (centre - cam_pos) / np.linalg.norm(centre - cam_pos)
+        ref = base_board[:3, 0] - z * (base_board[:3, 0] @ z)
+        ref /= np.linalg.norm(ref)
+        # Roll around READY's camera roll turned with the arm about the base (joint 1),
+        # as plan_views does around the look pose's.
+        turn = math.atan2(cam_pos[1], cam_pos[0]) - math.atan2(ready_camera[1, 3], ready_camera[0, 3])
+        ready_x = Rotation.from_rotvec([0.0, 0.0, turn]).apply(ready_camera[:3, 0])
+        x0 = ready_x - z * (ready_x @ z)
+        roll = math.atan2(np.cross(ref, x0) @ z, ref @ x0) + math.radians(rng.uniform(-p.max_roll_deg, p.max_roll_deg))
+        xa = math.cos(roll) * ref + math.sin(roll) * np.cross(z, ref)
+        cam = np.eye(4)
+        cam[:3, :3] = np.c_[xa, np.cross(z, xa), z]
+        cam[:3, 3] = cam_pos
+        target = cam @ np.linalg.inv(x)
+        for s in seeds:
+            q, err = panda.ik_link6(target, s)
+            if err < 1e-4 and np.all(q[:6] >= lo[:6]) and np.all(q[:6] <= hi[:6]) and clear(q) \
+                    and camera_arm_clearance(q, x) >= CAMERA_ARM_CLEARANCE_M and visible(q):
+                found.append((q, cam, math.degrees(tilt), math.degrees(az)))
+                break
+        if len(found) >= max(15 * count, 60):
+            break
+    if not found:
+        return [], ["robot side: WARNING no reachable view of the board from the robot's side"]
+
+    # A chain from READY: the next view is one reachable on a clean path from the
+    # last one that can also go back to READY, and among those the one whose
+    # view direction differs most from the views so far (READY's included).
+    def direction_of(q):
+        return (panda.fk(q, "panda_link6") @ x)[:3, 2]
+
+    directions = [direction_of(ready)]
+    chain, current = [], ready
+    while len(chain) < count:
+        options = [i for i in range(len(found)) if i not in chain
+                   and segment_ok(current, found[i][0]) and segment_ok(found[i][0], ready)]
+        if not options:
+            break
+        nxt = max(options, key=lambda i: min(math.acos(np.clip(found[i][1][:3, 2] @ d, -1, 1))
+                                             for d in directions))
+        chain.append(nxt)
+        directions.append(found[nxt][1][:3, 2])
+        current = found[nxt][0]
+    if not chain:
+        return [], [f"robot side: WARNING {len(found)} reachable views, but none with clean paths from READY"]
+    path = [ready] + [found[i][0] for i in chain] + [ready]
+    step = max(float(np.abs(b - a).max()) for a, b in zip(path, path[1:]))
+    tilts = [found[i][2] for i in chain]
+    azimuths = [found[i][3] for i in chain]
+    report = [f"robot side: {len(chain)} of {count} views (from {len(found)} candidates), camera "
+              f"{min(tilts):.0f}-{max(tilts):.0f} deg from the board normal, "
+              f"{min(azimuths):+.0f} to {max(azimuths):+.0f} deg around the direction to the base; "
+              f"visited from READY and back, largest single-joint move {math.degrees(step):.0f} deg",
+              "READY sees the whole board, so its image is one more robot-side view" if visible(ready)
+              else "READY does not see the whole board: its image will not fit (it is only a waypoint)"]
+    return [found[i][0] for i in chain], report
+
+
+def plan_views(q0, base_board, x, K, width, height, count, p, robot_side=0):
     """Joint poses that view the static board from varied directions.
 
     Every candidate is checked for joint-limit margin, clearance of every link
     origin above the board top (also along the joint-space path between
     consecutive poses) and full board visibility with an image margin.
+    With *robot_side* > 0 that many views from the robot's side come first,
+    then READY, then the look pose and the rest (see robot_side_views).
     Returns (poses, report lines).
     """
     rng = np.random.default_rng(p.seed)
@@ -169,10 +294,22 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
         lo[:6] = np.maximum(lo[:6], q0[:6] - m)
         hi[:6] = np.minimum(hi[:6], q0[:6] + m)
 
+    def clear(q):
+        return panda.frame_origins(q)[1:, 2].min() > table_z + p.clearance
+
     def ok_pose(q):
         if np.any(q < lo) or np.any(q > hi):
             return False
-        return panda.frame_origins(q)[1:, 2].min() > table_z + p.clearance
+        return clear(q)
+
+    def visible(q):
+        """All board corners inside the image, image_margin from its edges."""
+        cb = np.linalg.inv(panda.fk(q, "panda_link6") @ x) @ base_board @ corners.T
+        if np.any(cb[2] <= 0):
+            return False
+        uv = (K @ (cb[:3] / cb[2])).T[:, :2]
+        return not (np.any(uv < p.image_margin) or np.any(uv[:, 0] > width - p.image_margin)
+                    or np.any(uv[:, 1] > height - p.image_margin))
 
     accepted = []
     for _ in range(4000):
@@ -209,10 +346,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
         if best is None:
             continue
         q = best[0]
-        cb = np.linalg.inv(panda.fk(q, "panda_link6") @ x) @ base_board @ corners.T
-        uv = (K @ (cb[:3] / cb[2])).T[:, :2]
-        if np.any(uv < p.image_margin) or np.any(uv[:, 0] > width - p.image_margin) \
-                or np.any(uv[:, 1] > height - p.image_margin):
+        if not visible(q):
             continue
         accepted.append((q, cam))
         if len(accepted) >= max(15 * count, 450):
@@ -236,8 +370,7 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
     def segment_ok(qa, qb):
         if np.degrees(np.abs(qb - qa).max()) > p.max_step_deg:
             return False
-        return all(panda.frame_origins(qa + s * (qb - qa))[1:, 2].min() > table_z + p.clearance
-                   for s in np.linspace(0, 1, 60))
+        return all(clear(qa + s * (qb - qa)) for s in np.linspace(0, 1, 60))
 
     order, current, left = [], q0, list(chosen)
     while left:
@@ -268,6 +401,14 @@ def plan_views(q0, base_board, x, K, width, height, count, p):
               f"view tilt {min(tilts):.0f}-{max(tilts):.0f} deg, distance {min(dists):.2f}-{max(dists):.2f} m",
               f"lowest link origin above the board top along all paths: {path_min * 1000:.0f} mm",
               f"largest single-joint move between consecutive poses: {max_step:.0f} deg"]
+    if robot_side > 0:
+        # READY -> robot-side views -> READY -> look pose: READY -> look pose is the
+        # path the capture tool already takes at the start.
+        side, side_report = robot_side_views(robot_side, centre, normal, base_board, x, visible, clear,
+                                             segment_ok, p)
+        if side:
+            poses = side + [panda.READY.copy()] + poses
+        report += side_report
     return poses, report
 
 
@@ -381,7 +522,8 @@ def make_steps(stage: str) -> list[Step]:
             x = _calibration(ctx).x
         params = SimpleNamespace(**e["plan"])
         poses, report = plan_views(q0, base_board, x, rimfit.k_matrix(intr), info["width"],
-                                   info["height"], e[stage]["views"], params)
+                                   info["height"], e[stage]["views"], params,
+                                   robot_side=int(e[stage].get("robot_side_views", 0)))
         (out / "poses.yaml").write_text(yaml.safe_dump({
             "joint_names": panda.JOINT_NAMES,
             "poses": [{"joints": [round(float(v), 6) for v in q]} for q in poses]}))
@@ -512,12 +654,18 @@ def make_steps(stage: str) -> list[Step]:
         spread = {w["name"]: corner_distance_mm(cal.base_board(w["q"], w["cam_board"]), base_board)
                   for w in views}
         values = np.array(list(spread.values()))
+        shifted = base_board.copy()
+        shifted[:3, 3] += CALIBRATE_BOARD_SHIFT_BASE_M
         board = {
             "schema_version": 1, "units": "m", "base_frame": "panda_link0", "board_frame": "board",
             "board_surface_z_m": SURFACE_Z,
-            "T_base_board": base_board.tolist(),
+            "T_base_board": shifted.tolist(),
+            "test_shift_base_m": CALIBRATE_BOARD_SHIFT_BASE_M.tolist(),
+            "T_base_board_fitted": base_board.tolist(),
             "frame_note": ("true kinematic frame (calibrated joint offsets applied); "
-                           "probe targets are corrected per hole by `pipeline check/probe`"),
+                           "probe targets are corrected per hole by `pipeline check/probe`. "
+                           "T_base_board includes test_shift_base_m (a test hack in eye_in_hand.py); "
+                           "T_base_board_fitted is the pose the calibration found"),
             "validity_note": ("board pose fitted by `calibrate`; valid only while the board stays "
                               "where it was during calibration. Run `pipeline locate` after it moves."),
             "quality": {"views_used": len(views), "views_fitted": len(views),
@@ -532,8 +680,11 @@ def make_steps(stage: str) -> list[Step]:
         text = json.dumps(board, indent=2)
         (out / BOARD_POSE).write_text(text)
         (ctx.session.path / BOARD_POSE).write_text(text)
-        centre = base_board @ np.array([0, 0, SURFACE_Z, 1])
+        centre = shifted @ np.array([0, 0, SURFACE_Z, 1])
         print(f"  board top centre in base: {np.round(centre[:3] * 1000, 2)} mm")
+        if np.any(CALIBRATE_BOARD_SHIFT_BASE_M):
+            print(f"  WARNING test hack: the board is written {np.round(CALIBRATE_BOARD_SHIFT_BASE_M * 1000, 2)} mm "
+                  "(base x, y, z) away from the fitted pose (CALIBRATE_BOARD_SHIFT_BASE_M in eye_in_hand.py)")
         print(f"  wrote {ctx.session.path / BOARD_POSE} (valid while the board does not move; "
               "`pipeline check/probe` can run now)")
 

@@ -12,7 +12,10 @@ from panda_calibration.board_pose import (
     tip_position_in_base,
     validate_board_offset,
 )
-from panda_calibration.board_manipulation import compensate_pose_for_measured_error
+from panda_calibration.board_manipulation import (
+    compensate_pose_for_measured_error,
+    pen_tip_report,
+)
 from panda_calibration.kinematics import (
     conservative_joint_tolerances,
     make_transform,
@@ -132,6 +135,29 @@ class BoardManipulationGeometryTest(unittest.TestCase):
         tolerance = conservative_joint_tolerances(jacobian, 0.0001, 0.0002)
         self.assertEqual(tolerance.shape, (3,))
         self.assertAlmostEqual(float(tolerance[0]), 0.0001 / 3.0)
+
+    def test_pen_tip_report_in_board_axes(self):
+        # A board turned -92 deg and tilted 0.5 deg, and the round peg's off-axis tip.
+        board = make_transform(
+            rotation_from_axis_angle(np.array([0.0, 0.0, 1.0]), math.radians(-92.0))
+            @ rotation_from_axis_angle(np.array([1.0, 0.3, 0.0]), math.radians(0.5)),
+            [0.5, 0.1, 0.0])
+        offset = np.array([0.0, -0.01649, 0.039])
+        point = np.array([-0.127838, -0.03865, 0.0])
+        tcp, _ = board_target_pose(board, 0.025, point, 0.02, [math.pi, 0.0, -math.pi / 2], offset)
+        target = board @ np.r_[point[:2], 0.025, 1.0]
+
+        on_target = pen_tip_report(tcp, offset, board, target)
+        self.assertIn('x +0.00, y +0.00 mm (0.00 mm beside), 0.00 mm above it', on_target)
+
+        # 3 mm along the board normal, and 1 mm along board -x.
+        moved = tcp.copy()
+        moved[:3, 3] += board[:3, :3] @ np.array([-0.001, 0.0, 0.003])
+        report = pen_tip_report(moved, offset, board, target)
+        self.assertIn('x -1.00, y +0.00 mm (1.00 mm beside), 3.00 mm above it', report)
+        below = tcp.copy()
+        below[:3, 3] -= board[:3, 2] * 0.0005
+        self.assertIn('0.50 mm below it', pen_tip_report(below, offset, board, target))
 
 
 if __name__ == '__main__':

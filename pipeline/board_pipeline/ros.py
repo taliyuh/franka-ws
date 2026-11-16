@@ -40,6 +40,17 @@ def container_path(cfg: Config, path: Path) -> str:
     return str(Path(cfg["docker"]["workspace"]) / relative)
 
 
+def host_path(cfg: Config, value: str) -> Path:
+    """A path given on the host, or one a container tool printed (/franka_ws/...)."""
+    path = Path(value).expanduser()
+    if not path.exists() and path.is_absolute():
+        try:
+            return cfg.workspace / path.relative_to(cfg["docker"]["workspace"])
+        except ValueError:
+            pass
+    return path
+
+
 def ensure_container(cfg: Config) -> None:
     name = cfg["docker"]["container"]
     result = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],

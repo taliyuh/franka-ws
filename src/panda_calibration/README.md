@@ -13,7 +13,11 @@ directly.
 | `run_taught_capture` | replay taught poses (or `--manual`), record tag views | stationary `calibrate` |
 | `capture_stereo_rgbd` | one synchronized RGB-D frame per camera | stationary `locate` |
 | `solve_handeye` / `solve_joint_handeye` | base-to-camera from a tag capture (one / several cameras) | stationary `calibrate` |
-| `probe_board` | approach a board point and descend in guarded steps | `check`, `probe` |
+| `probe_board` | approach a board point and descend in guarded steps; `--record FILE` saves the commanded and measured pose and joints of every move and holds at the bottom for photos | `check`, `probe`, `accuracy` |
+| `plot_probe_accuracy` | figure, table and summary of an `accuracy` run | `accuracy` |
+| `grasp_peg` / `release_peg` | close the hand on a peg (`--until-contact`: until it clamps) / open it (franka_gripper grasp / move actions) | `grasp`, `release`, `accuracy` |
+| `pivot_calibration` | measure the held tool's tip by pivoting it in a dimple | `check`/`probe --tip-from` |
+| `measure_repeatability` | return to hand-taught joint angles from home, uncompensated; save and plot the errors | `repeatability` |
 
 ## Robot runtime
 
@@ -54,7 +58,8 @@ Cartesian checks use the robot's own measured end-effector pose (`O_T_EE` in
 `/franka_state_controller/franka_states`). That is the end effector set in
 Desk; with the Franka Hand selected it coincides with `panda_hand_tcp`. Every
 tool compares the two once at startup and warns (`probe_board` refuses) when
-they differ by more than 2 mm / 0.57 deg.
+they differ by more than 2 mm / 0.57 deg (usually `NE_T_EE` is not the
+identity; reset: `pipeline/DETAILS.md`, Robot checks).
 
 Motion settings are in `config/calibration_hardware.yaml` (`motion:`): joint
 speed, minimum move duration, settle detection and the Cartesian checks
@@ -81,15 +86,41 @@ rosrun panda_calibration probe_board \
 ```
 
 `--offset` is in the board frame (origin at the centre of the bottom face).
-Without `--dry-run` it asks before moving to 15 cm above the point (measured
-from the board plane at the pen tip), then descends in 3 mm segments until
-Enter is pressed. Each move is checked against the measured TCP (0.1 mm /
-0.05 deg) and corrected up to 3 times when the residual is inside the
-correction window (in Gazebo the first move lands ~0.25 mm off and one
-correction brings it to ~0.03 mm). It never commands the pen tip below the board plane, and
-retracts after confirmation. Measure `probe.pen_tip_offset_tcp_m` and
-`probe.tcp_orientation_board_rpy` in `config/board_manipulation.yaml` for the
-actual tool. Keep the e-stop at hand.
+Without `--dry-run` it asks b`--offset` is in the board frame (origin at the centre of the bottom face).
+Without `--dry-run` it asks, moves 20 mm above the point, then descends in 3 mm
+steps until Enter or the target. Each move is corrected up to 3 times until it
+is within 0.2 mm of the measured TCP. The tip never goes below the board plane.
+
+* `--where` (`--watch`): print where the tip is, no motion.
+* `--record FILE`: save every move for `pipeline accuracy` and hold at the
+  bottom for photos.
+
+Tool and speeds: `config/board_manipulation.yaml`. Keep the e-stop at hand.
+
+lue:
+
+```bash
+rosrun panda_calibration pivot_calibration          # robot.launch running
+```
+
+It stops `position_joint_trajectory_controller` so the arm can be guided by
+hand, and restarts it at the end. Put the tip in one fixed point, ideally a
+small conical dimple so it cannot slide. Release the guiding buttons and press
+Enter to record a pose (the arm must be still for 0.5 s), and repeat from other
+orientations: tilt 30–60° in different directions and turn about the tool axis.
+After 4 poses every new one prints the current fit.
+
+The fit solves `R_i · tip + t_i = pivot` for all poses (measured `O_T_EE`) by
+least squares. The result goes to `/franka_ws/tool_calibration/pivot_<date>_<time>.yaml`:
+`tip_in_tcp_m` is the TCP → tip vector in `panda_hand_tcp` axes, the frame of
+`probe.pen_tip_offset_tcp_m` and of the `tip [...] mm from the TCP` line that
+`pipeline check/probe` print; `tip_in_flange_m` is the same point in
+`panda_link8`. The file also keeps the residuals, a leave-one-out error and
+every pose, so `--resolve FILE --drop 3,7` solves again without poses that
+slipped. Only the tip position is measured, not the direction of the tool axis.
+`--shape` (default `round`) records which peg the tool stands in for;
+`pipeline check/probe --tip-from FILE` then uses the measured tip for that
+shape only (see `pipeline/DETAILS.md`).
 
 ## Dataset layout
 
@@ -168,6 +199,10 @@ the live `/robot_description` parameter.
 | `panda_calibration/capture_stereo_rgbd.py` | `capture_stereo_rgbd` |
 | `panda_calibration/solve_handeye.py` | `solve_handeye`, `solve_joint_handeye` |
 | `panda_calibration/board_manipulation.py`, `board_pose.py` | `probe_board` |
+| `panda_calibration/probe_accuracy.py` | `probe_board --record`, `plot_probe_accuracy` |
+| `panda_calibration/gripper.py` | `grasp_peg` (incl. `--until-contact`), `release_peg` |
+| `panda_calibration/pivot_calibration.py` | `pivot_calibration` |
+| `panda_calibration/repeatability.py` | `measure_repeatability` |
 | `scripts/` | the `rosrun` executables (thin wrappers around the modules) |
 | `launch/robot.launch` | franka_control + position trajectory controller + move_group |
 | `launch/azure_4k.launch`, `launch/orbbec_4k.launch` | the 4K camera setups |

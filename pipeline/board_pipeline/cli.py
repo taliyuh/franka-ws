@@ -1,15 +1,18 @@
-"""`pipeline` command line. See pipeline/README.md."""
+"""`pipeline` command line. See pipeline/README.md and pipeline/DETAILS.md."""
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import sys
+from pathlib import Path
 
 import numpy as np
+import yaml
 
-from board_pipeline import eye_in_hand, grasp, ros, stationary
+from board_pipeline import diagnose, eye_in_hand, grasp, ros, stationary
 from board_pipeline.config import SETUPS, Config, PipelineError, load_yaml
 from board_pipeline.session import (BOARD_POSE, CALIBRATION, REUSED, Context, Session,
                                     run_stage, step_status)
@@ -128,48 +131,254 @@ def cmd_holes(cfg: Config, args) -> None:
         print(line)
 
 
-def cmd_probe(cfg: Config, args) -> None:
-    session = Session.open(cfg, args.session)
-    holes = _holes(session.cfg)
-    if args.hole not in holes:
-        raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
-    hole = holes[args.hole]
-    tool = grasp.hole_tool(session.cfg, hole, args.hole)
+def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None, height_mm: float,
+                  turn_deg: float = 0.0):
+    """Write one hole's target and tool files; returns (tool, tip source, target file, probe_board argv)."""
+    if name not in holes:
+        raise PipelineError(f"unknown hole {name!r}; `pipeline holes` lists them")
+    hole = holes[name]
+    tool = grasp.hole_tool(session.cfg, hole, name, turn_deg)
+    tip_source = "CAD"
+    if tip_from:
+        tool, tip_source = grasp.apply_pivot_tip(
+            tool, grasp.load_pivot_tip(ros.host_path(session.cfg, tip_from)))
     print(f"held peg: {tool.shape} in the V-block fingers (grasp width {tool.grasp_width_mm:.2f} mm), "
           f"peg yaw {math.degrees(tool.peg_yaw):.2f} deg on the board, "
-          f"tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP")
-    target = _module(session.cfg.setup).hole_target(session, session.cfg, hole, args.hole, tool)
+          f"tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP ({tip_source})")
+    target = _module(session.cfg.setup).hole_target(session, session.cfg, hole, name, tool)
     manipulation = grasp.write_manipulation_config(
-        session.cfg, tool, session.path / "targets" / f"{args.hole}_tool.yaml")
-    dry = args.command == "check"
+        session.cfg, tool, session.path / "targets" / f"{name}_tool.yaml")
     argv = ["--board-pose", ros.container_path(session.cfg, target),
-            "--offset", float(tool.point[0]), float(tool.point[1]), args.height / 1000.0,
+            "--offset", float(tool.point[0]), float(tool.point[1]), height_mm / 1000.0,
             "--config", ros.container_path(session.cfg, session.cfg.path(session.cfg["robot"]["config"])),
             "--manipulation-config", ros.container_path(session.cfg, manipulation)]
-    if dry:
+    return tool, tip_source, target, argv
+
+
+def cmd_probe(cfg: Config, args) -> None:
+    session = Session.open(cfg, args.session)
+    _, _, _, argv = _probe_target(session, _holes(session.cfg), args.hole, args.tip_from, args.height,
+                                  args.turn)
+    if args.command == "check":
         argv.append("--dry-run")
+    elif args.command == "tip":
+        # Only reads the robot state: no controller needed, so no readiness check.
+        argv += ["--where", "--watch"] if args.watch else ["--where"]
     else:
         ros.check_robot_ready(session.cfg)
         print("Enter approves the approach, Enter during the descent stops it, "
               "Enter again retracts. Keep the e-stop at hand.")
-    ros.rosrun(session.cfg, "panda_calibration", "probe_board", *argv, interactive=not dry)
-    if dry:
+    interactive = args.command == "probe" or (args.command == "tip" and args.watch)
+    ros.rosrun(session.cfg, "panda_calibration", "probe_board", *argv, interactive=interactive)
+    if args.command == "check":
         print(f"\nlooks right? `pipeline probe --hole {args.hole}` moves the arm")
 
 
 def cmd_grasp(cfg: Config, args) -> None:
     # The session's config snapshot if there is one, else the template: the
-    # grasp width only needs holes.yaml and grasps.yaml, not a board pose.
+    # grasp width only needs grasps.yaml, not a board pose.
     if args.session or Session.current_link(cfg).is_symlink():
         cfg = Session.open(cfg, args.session).cfg
+    name = args.shape or args.hole
+    if not name:
+        raise PipelineError("which peg? e.g. `pipeline grasp round` "
+                            "(round, hexagon, triangle, rectangle or l_shape)")
     holes = _holes(cfg)
-    if args.hole not in holes:
-        raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
-    tool = grasp.hole_tool(cfg, holes[args.hole], args.hole)
-    print(f"closing the hand on the {tool.shape} peg: width {tool.grasp_width_mm:.2f} mm "
-          f"+-{args.epsilon:g} mm, force {args.force:g} N")
-    ros.rosrun(cfg, "panda_calibration", "grasp_peg", "--width", tool.grasp_width_mm / 1000.0,
-               "--epsilon", args.epsilon / 1000.0, "--force", args.force)
+    shape = holes[name]["shape"] if name in holes else name  # a hole name means its peg
+    width = grasp.grasp_width_mm(cfg, shape)
+    if args.epsilon is not None:
+        print(f"closing the hand on the {shape} peg: width {width:.2f} mm "
+              f"+-{args.epsilon:g} mm, force {args.force:g} N")
+        ros.rosrun(cfg, "panda_calibration", "grasp_peg", "--width", f"{width / 1000.0:.6f}",
+                   "--epsilon", args.epsilon / 1000.0, "--force", args.force)
+        return
+    # Pegs sit deeper in the printed V than the CAD width says, and the finger reading
+    # drifts: close until the fingers clamp and accept anything up to the CAD width + 1 mm.
+    print(f"closing the hand on the {shape} peg until it clamps (accepted up to {width + 1.0:.2f} mm, "
+          f"CAD {width:.2f} mm), force {args.force:g} N")
+    ros.rosrun(cfg, "panda_calibration", "grasp_peg", "--width", f"{width / 1000.0:.6f}",
+               "--until-contact", "--force", args.force)
+
+
+def cmd_release(cfg: Config, args) -> None:
+    print(f"opening the hand to {args.width:g} mm")
+    ros.rosrun(cfg, "panda_calibration", "release_peg", "--width", args.width / 1000.0)
+
+
+def cmd_repeatability(cfg: Config, args) -> None:
+    if args.session or Session.current_link(cfg).is_symlink():
+        cfg = Session.open(cfg, args.session).cfg
+    if args.resume:
+        runs = sorted(path.parent for path in (cfg.workspace / "repeatability").glob("*/run.yaml"))
+        out = ros.host_path(cfg, args.resume) if args.resume != "latest" else (runs[-1] if runs else None)
+        if out is None or not (out / "run.yaml").exists():
+            raise PipelineError(f"no run to resume: {out or 'repeatability/ has no run.yaml'}")
+        print(f"resuming {out}")
+        argv = ["--resume", ros.container_path(cfg, out)] + (["--no-grasp"] if args.no_grasp else [])
+    else:
+        holes = _holes(cfg)
+        name = next((n for n, hole in holes.items() if hole["shape"] == args.shape), None)
+        if name is None:
+            raise PipelineError(f"no hole for peg shape {args.shape!r} in {cfg['holes']}")
+        # Any hole of the shape will do: the tip offset and the grasp width depend on the peg only.
+        tool = grasp.hole_tool(cfg, holes[name], name)
+        tip_source = "CAD"
+        if args.tip_from:
+            tool, tip_source = grasp.apply_pivot_tip(tool, grasp.load_pivot_tip(ros.host_path(cfg, args.tip_from)))
+        print(f"held peg: {tool.shape}, tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP ({tip_source})")
+        out = cfg.workspace / "repeatability" / datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        # Fixed-point: argparse takes "-2e-18" for an option, not for a negative number.
+        argv = ["--out", ros.container_path(cfg, out), "--tip-offset", *(f"{v:.6f}" for v in tool.tip_offset),
+                "--tip-source", tip_source.split(";")[0], "--shape", tool.shape,
+                "--speed-scale", args.speed_scale, "--dwell", args.dwell]
+        if not args.no_grasp:
+            argv += ["--grasp-width", tool.grasp_width_mm / 1000.0]
+    argv += ["--distances", *args.distances, "--repeats", args.repeats]
+    ros.check_robot_ready(cfg)
+    try:
+        ros.rosrun(cfg, "panda_calibration", "measure_repeatability", *argv, interactive=True)
+    finally:
+        print(f"\nresults (kept after an interrupted run too): {out}")
+
+
+# The holes `pipeline accuracy` probes by default: the tightest and the loosest of two shapes.
+ACCURACY_HOLES = ("round_c0p03mm", "round_c3mm", "rectangle_c0p03mm", "rectangle_c3mm")
+ACCURACY_PLAN = "plan.yaml"
+RELEASE_WIDTH_MM = 30.0   # wider than every grasp
+
+
+def _accuracy_run(session: Session, chosen: str) -> Path:
+    """The newest run under the session's accuracy/ for "latest", else the folder given."""
+    if chosen == "latest":
+        runs = sorted(path.parent for path in (session.path / "accuracy").glob(f"*/{ACCURACY_PLAN}"))
+        if not runs:
+            raise PipelineError(f"no run in {session.path / 'accuracy'}; start one with `pipeline accuracy`")
+        return runs[-1]
+    run = ros.host_path(session.cfg, chosen)
+    if not (run / ACCURACY_PLAN).exists():
+        raise PipelineError(f"{run} is not a `pipeline accuracy` run (it has no {ACCURACY_PLAN})")
+    return run
+
+
+def _save_plan(run: Path, plan: dict) -> None:
+    (run / ACCURACY_PLAN).write_text("# `pipeline accuracy`: the holes in order; probe_board writes one "
+                                     "<hole>.yaml per probed hole\n" + yaml.safe_dump(plan, sort_keys=False))
+
+
+def _correction_mm(target: Path, tool, height_mm: float):
+    """How far the joint-offset correction moved the tip target, mm; None when there is none."""
+    data = json.loads(Path(target).read_text())
+    true = data.get("source", {}).get("T_base_board_true_frame")
+    if true is None:
+        return None
+    point = np.r_[tool.point, data["board_surface_z_m"] + height_mm / 1000.0, 1.0]
+    shift = (np.asarray(data["T_base_board"]) - np.asarray(true)) @ point
+    return [round(float(v) * 1000.0, 3) for v in shift[:3]]
+
+
+def _hand_peg(cfg: Config, shape: str, held: str | None) -> None:
+    """Get the peg of this shape into the fingers; PipelineError when the operator stops."""
+    width = grasp.grasp_width_mm(cfg, shape)
+    print(f"\nthe next holes need the {shape} peg" + (f"; the hand holds the {held} peg" if held else ""))
+    while True:
+        answer = input(f"Enter = the {shape} peg is in the fingers, g = put it in now (opens the hand, "
+                       "then closes it on the peg), q = stop > ").strip().lower()
+        if answer == "q":
+            raise PipelineError("stopped before the next hole")
+        if answer == "":
+            return
+        if answer != "g":
+            print("  Enter, g or q")
+            continue
+        try:
+            input("Hold the peg that is in the fingers, if any: it drops when the hand opens. "
+                  "Enter = open the hand > ")
+            ros.rosrun(cfg, "panda_calibration", "release_peg", "--width", RELEASE_WIDTH_MM / 1000.0)
+            input(f"Put the {shape} peg in the V-block fingers and hold it there. Enter = close the hand > ")
+            ros.rosrun(cfg, "panda_calibration", "grasp_peg", "--width", f"{width / 1000.0:.6f}", "--until-contact")
+            return
+        except PipelineError as error:
+            print(f"  {error}. g = try again, Enter = the peg is held anyway")
+
+
+def _probe_holes(session: Session, holes: dict, run: Path, plan: dict) -> None:
+    held = None
+    total = len(plan["holes"])
+    for index, entry in enumerate(plan["holes"], 1):
+        name = entry["name"]
+        record = run / f"{name}.yaml"
+        status = load_yaml(record).get("status") if record.exists() else None
+        if status == "done":
+            print(f"\n{index}/{total} {name}: probed earlier, skipped")
+            continue
+        print(f"\n=== {index}/{total}: {name} ({entry['shape']} peg, clearance {entry['clearance_mm']:g} mm) ===")
+        if status:
+            print(f"the earlier try ended {status}; probing it again (its record is replaced)")
+        if entry["shape"] != held:
+            _hand_peg(session.cfg, entry["shape"], held)
+            held = entry["shape"]
+        tool, tip_source, target, argv = _probe_target(session, holes, name, plan["tip_from"], plan["height_mm"])
+        entry.update(tip_offset_tcp_mm=[round(float(v) * 1000.0, 3) for v in tool.tip_offset],
+                     tip_source=tip_source.split(";")[0],
+                     correction_mm=_correction_mm(target, tool, plan["height_mm"]), target=str(target))
+        _save_plan(run, plan)
+        ros.rosrun(session.cfg, "panda_calibration", "probe_board", *argv,
+                   "--record", ros.container_path(session.cfg, record), interactive=True, own=run)
+
+
+def _plot_accuracy(cfg: Config, run: Path) -> None:
+    ros.rosrun(cfg, "panda_calibration", "plot_probe_accuracy", ros.container_path(cfg, run), own=run)
+
+
+def cmd_accuracy(cfg: Config, args) -> None:
+    session = Session.open(cfg, args.session)
+    if args.plot:
+        run = _accuracy_run(session, args.plot)
+        _plot_accuracy(session.cfg, run)
+        print(f"\nresults: {run}")
+        return
+    holes = _holes(session.cfg)
+    if args.resume:
+        if args.holes:
+            raise PipelineError("--resume continues the saved list of holes; give no holes with it")
+        run = _accuracy_run(session, args.resume)
+        plan = load_yaml(run / ACCURACY_PLAN)
+        print(f"resuming {run} (its --height and --tip-from)")
+    else:
+        names = args.holes or list(ACCURACY_HOLES)
+        unknown = [name for name in names if name not in holes]
+        if unknown:
+            raise PipelineError(f"unknown hole(s) {', '.join(unknown)}; `pipeline holes` lists them")
+        now = datetime.datetime.now()
+        run = session.path / "accuracy" / now.strftime("%Y-%m-%d_%H%M%S")
+        plan = {"session": session.name, "created": now.isoformat(timespec="seconds"),
+                "height_mm": args.height, "tip_from": args.tip_from,
+                "holes": [{"name": name, "shape": holes[name]["shape"],
+                           "clearance_mm": holes[name]["clearance_mm"]} for name in names]}
+        run.mkdir(parents=True)
+        _save_plan(run, plan)
+    ros.check_robot_ready(session.cfg)
+    print(f"holes: {', '.join(entry['name'] for entry in plan['holes'])}\n"
+          "Each hole: Enter approves the move above it; the tip then goes down in 3 mm steps (Enter stops\n"
+          "it) and the arm holds at the bottom for your photos. Type what you see, Enter retracts.\n"
+          "The moves between holes go straight in joint space, 2 cm above the board. Keep the e-stop at hand.")
+    try:
+        _probe_holes(session, holes, run, plan)
+    except PipelineError as error:
+        raise PipelineError(f"{error}\n`pipeline accuracy --resume` probes the holes not done yet") from None
+    except KeyboardInterrupt:
+        raise PipelineError("interrupted; `pipeline accuracy --resume` probes the holes not done yet") from None
+    finally:
+        if any((run / f"{entry['name']}.yaml").exists() for entry in plan["holes"]):
+            try:
+                _plot_accuracy(session.cfg, run)
+            except PipelineError as error:
+                print(f"no figure: {error}", file=sys.stderr)
+        print(f"\nresults: {run}")
+
+
+def cmd_diag(cfg: Config, args) -> None:
+    diagnose.run(Session.open(cfg, args.session), args, _hand_peg)
 
 
 # ---------------------------------------------------------------------- main
@@ -178,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pipeline",
         description="Camera calibration, board localisation and hole probing for the Franka Panda.",
         epilog="Run on the host. Typical run: new -> calibrate -> locate -> grasp -> check -> probe "
-               "(robot and cameras launched by hand in the container)")
+               "-> release (robot and cameras launched by hand in the container)")
     parser.add_argument("--session", help="session to use instead of the current one")
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -211,20 +420,105 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(func=cmd_stage)
 
     for command, text in (("check", "dry run: validate the target and IK, no motion"),
-                          ("probe", "move the held peg's tip onto a hole (guarded descent)")):
+                          ("probe", "move the held peg's tip onto a hole (guarded descent)"),
+                          ("tip", "show where the held peg's tip is relative to a hole, no motion")):
         p = sub.add_parser(command, help=text)
         p.add_argument("--hole", required=True, help="e.g. round_c3mm; `pipeline holes` lists them")
         p.add_argument("--height", type=float, default=0.0, metavar="MM",
                        help="peg tip height above the board surface, mm (default 0)")
+        p.add_argument("--tip-from", metavar="FILE",
+                       help="use the peg tip measured by `rosrun panda_calibration pivot_calibration` "
+                            "(only for the peg shape it was measured on) instead of the CAD tip")
+        p.add_argument("--turn", type=float, default=0.0, metavar="DEG",
+                       help="turn the hand this much further about the peg axis (a multiple of the peg's "
+                            "symmetry; any angle for the round peg). `pipeline diag 3` is the measured version")
+        if command == "tip":
+            p.add_argument("--watch", action="store_true",
+                           help="keep printing twice a second until Ctrl-C (also while hand-guiding)")
         p.set_defaults(func=cmd_probe)
 
-    p = sub.add_parser("grasp", help="close the hand on the peg for a hole (width from config/grasps.yaml)")
-    p.add_argument("--hole", required=True, help="e.g. round_c1mm; `pipeline holes` lists them")
+    p = sub.add_parser("grasp", help="close the hand on a peg (width from config/grasps.yaml)")
+    p.add_argument("shape", nargs="?", metavar="SHAPE",
+                   help="peg shape: round, hexagon, triangle, rectangle or l_shape")
+    p.add_argument("--hole", metavar="NAME",
+                   help="instead of SHAPE: a shape, or a hole name (round_c1mm) meaning its peg")
     p.add_argument("--force", type=float, default=20.0, metavar="N",
                    help="grip force, N (default 20; the Franka Hand allows 70 continuously)")
-    p.add_argument("--epsilon", type=float, default=1.0, metavar="MM",
-                   help="accepted deviation from the grasp width, mm (default 1)")
+    p.add_argument("--epsilon", type=float, default=None, metavar="MM",
+                   help="instead of closing until contact, require the CAD width +- MM (the old check)")
     p.set_defaults(func=cmd_grasp)
+
+    p = sub.add_parser("release", help="open the hand and let go of the peg (it drops if not held)")
+    p.add_argument("--width", type=float, default=30.0, metavar="MM",
+                   help="open the fingers to this width, mm (default 30, wider than every grasp; max 80)")
+    p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("repeatability",
+                       help="teach points by hand, return to them from home, plot joint and tip errors "
+                            "(no compensation)")
+    p.add_argument("--shape", default="round", help="held peg (default round)")
+    p.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    p.add_argument("--distances", nargs="+", type=float, default=[25.0, 50.0, 75.0], metavar="CM",
+                   help="about how far from the base each point is, one per point (default 25 50 75)")
+    p.add_argument("--repeats", type=int, default=3, help="repeats per point (default 3)")
+    p.add_argument("--speed-scale", type=float, default=0.3,
+                   help="fraction of motion.max_joint_speed (default 0.3)")
+    p.add_argument("--dwell", type=float, default=1.0,
+                   help="seconds to wait after the arm has settled, before measuring (default 1)")
+    p.add_argument("--no-grasp", action="store_true", help="skip the step that closes the hand on the peg")
+    p.add_argument("--resume", nargs="?", const="latest", metavar="DIR",
+                   help="finish an interrupted run's unfinished points (default: the newest run)")
+    p.set_defaults(func=cmd_repeatability)
+
+    p = sub.add_parser("accuracy",
+                       help="probe several holes in a row: record target vs measured position and joints "
+                            "at every move, hold at the bottom for photos, plot the errors")
+    p.add_argument("holes", nargs="*", metavar="HOLE",
+                   help=f"holes in order (default: {' '.join(ACCURACY_HOLES)}); "
+                        "when the peg shape changes it asks you to swap the peg")
+    p.add_argument("--height", type=float, default=0.0, metavar="MM",
+                   help="where the descent ends: tip height above the board surface, mm "
+                        "(default 0: the tip at the surface, in the mouth of the hole)")
+    p.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    p.add_argument("--resume", nargs="?", const="latest", metavar="DIR",
+                   help="probe the holes an interrupted run did not finish (default: the newest run)")
+    p.add_argument("--plot", nargs="?", const="latest", metavar="DIR",
+                   help="only draw the figure and the table of a run again (default: the newest run)")
+    p.set_defaults(func=cmd_accuracy)
+
+    p = sub.add_parser(
+        "diag", help="tests that find where a constant probe error comes from (no number: a menu)",
+        description="Six diagnostic tests (pipeline/DETAILS.md, `pipeline diag`): 1 camera roll, 2 heights "
+                    "(vision only, the arm moves); 3 tool turn, 4 board turn, 5 board aside, 6 touch-off "
+                    "(hand-guided touches of holes). Without a number it lists them and asks.")
+    p.add_argument("test", nargs="?", type=int, choices=sorted(diagnose.TESTS), metavar="N",
+                   help="test number 1-6")
+    p.add_argument("--report", nargs="?", const="", metavar="DIR",
+                   help="only print the analysis of the newest run of test N (or of DIR)")
+    camera = p.add_argument_group("tests 1 and 2 (camera)")
+    camera.add_argument("--rolls", nargs="+", type=float, metavar="DEG",
+                        help=f"test 1: camera rolls about its optical axis, deg "
+                             f"(default {' '.join(f'{v:g}' for v in diagnose.DEFAULT_ROLLS)}; unreachable ones are skipped)")
+    camera.add_argument("--distance", type=float, metavar="M",
+                        help="test 1: camera distance from the board centre, m (default 0.50)")
+    camera.add_argument("--distances", nargs="+", type=float, metavar="M",
+                        help=f"test 2: camera distances from the board centre, m "
+                             f"(default {' '.join(f'{v:g}' for v in diagnose.DEFAULT_DISTANCES)})")
+    camera.add_argument("--view", choices=("top", "look"),
+                        help="camera direction: look = as the look pose sees the board (the view `locate` "
+                             "uses), top = along the board normal (default: look, else top)")
+    camera.add_argument("--max-step", type=float, metavar="DEG",
+                        help="largest single-joint move between poses (default plan.max_step_deg)")
+    camera.add_argument("--plan-only", action="store_true", help="plan and print the poses, do not move")
+    camera.add_argument("--yes", action="store_true", help="do not ask before moving the arm")
+    touch = p.add_argument_group("tests 3-6 (hand-guided touches)")
+    touch.add_argument("--holes", nargs="+", metavar="HOLE",
+                       help=f"holes to touch (tests 3-5 default {diagnose.DEFAULT_TOUCH_HOLE}; test 6 default "
+                            f"{' '.join(diagnose.DEFAULT_TOUCH_OFF)})")
+    touch.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    touch.add_argument("--new", action="store_true",
+                       help="tests 4 and 5: start a new series instead of adding a board placement to the last one")
+    p.set_defaults(func=cmd_diag)
     return parser
 
 
