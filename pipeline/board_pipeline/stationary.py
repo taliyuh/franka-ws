@@ -135,5 +135,6 @@ def make_steps(stage: str) -> list[Step]:
             Step("export", "express the board in the robot base frame", export)]
 
 
-def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
+def hole_target(session, cfg, hole: dict, name: str, tool, joint_correction: bool = True) -> Path:
+    # No joint-offset model here, so nothing to correct (joint_correction is ignored).
     return session.require(BOARD_POSE, "run `pipeline locate` first")

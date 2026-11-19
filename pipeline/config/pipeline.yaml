@@ -49,14 +49,49 @@ eye_in_hand:
   # timeouts; >1 tolerates a camera stream that stalls for a few seconds.
   timeout_scale: 3.0
   max_mad_px: 1.0            # reject board fits with a worse median rim residual
+  # Calibrated outside the pipeline on 2026-11-19. `calibrate` keeps these fixed;
+  # `calibrate --fit-intrinsics` / `--fit-joint-offsets` estimate them from the board
+  # views instead (the old behaviour). Sessions copy them into their config.yaml.
+  base_calibration:
+    # Azure colour camera, AprilGrid (pipeline/tools/calibrate_azure_intrinsics.py):
+    # fx fy cx cy refined, distortion kept at factory, 0.78 px RMS over 38 views.
+    intrinsics_source: camera_calibration/azure_2026-11-19_114622/intrinsics.json
+    intrinsics:
+      fx: 1848.9176873870458
+      fy: 1850.2389730721593
+      cx: 1921.5632329184084
+      cy: 1098.5255429628123
+      k1: 0.32419127225875854
+      k2: -2.520479679107666
+      p1: 0.00035915308399125934
+      p2: -0.00024095129629131407
+      k3: 1.5407172441482544
+      k4: 0.20744043588638306
+      k5: -2.3417866230010986
+      k6: 1.462856650352478
+    # Joint encoder offsets, true angle = reading + offset (pipeline/tools/joint_offsets:
+    # AprilGrid views + pen touches). J6 is uncertain (+-4 mrad); J1 and J7 are not observable.
+    joint_offsets_source: kinematic_calibration/2026-11-19_140123/joint_offsets.json
+    joint_offsets_rad:
+      panda_joint1: 0.0
+      panda_joint2: -0.002435263123034892
+      panda_joint3: 0.004534366003008772
+      panda_joint4: -0.0036185904484644766
+      panda_joint5: 0.007162572564426816
+      panda_joint6: -0.008341526338093718
+      panda_joint7: 0.0
   calibrate:
     views: 30
     # Extra views from the robot's side of the board (camera between the base and
     # the board, looking away from the robot), visited from READY before the
     # look pose: the views above all look back toward the base. 0 turns them off.
     robot_side_views: 4
-    bundle_free: [fx, fy, cx, cy]     # intrinsics refined by bundle adjustment
-    model: ["off", "scale", "sag"]    # chain error terms (quoted: YAML reads off as false), see eye_in_hand.chain_model
+    bundle_free: [fx, fy, cx, cy]     # refined by bundle adjustment, only with --fit-intrinsics
+    # Chain error terms (quoted: YAML reads off as false), see eye_in_hand.chain_model.
+    # "off" is fitted only with --fit-joint-offsets. scale and sag are off by default
+    # (2026-11-19: intrinsics and joint offsets come from base_calibration); add them
+    # back as "scale", "sag" to fit the camera distance scale and the mount sag.
+    model: ["off"]
   locate:
     views: 8
     max_view_spread_mm: 1.5           # views disagreeing more than this are dropped

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Joint encoder offset calibration (pipeline/tools/calibrate_joint_offsets.py) with the
+# pose-refinement interpreter, like pipeline/pipeline. Runs on the HOST; it starts the
+# ROS steps in the franka_ros container itself.
+#
+#   ./pipeline/tools/joint_offsets run --intrinsics camera_calibration/azure_<stamp>/intrinsics.json
+#   ./pipeline/tools/joint_offsets status            # progress of the newest run
+#   ./pipeline/tools/joint_offsets run --resume      # continue it where it stopped
+#   ./pipeline/tools/joint_offsets run --resume kinematic_calibration/<stamp> --from 2:capture
+#   ./pipeline/tools/joint_offsets plan          # plan from the current pose, nothing moves
+#   ./pipeline/tools/joint_offsets solve kinematic_calibration/<stamp> --compare sessions/current/calibration.json
+set -euo pipefail
+if [[ -f /.dockerenv ]]; then
+    echo "joint_offsets runs on the HOST, not in the container. In a host terminal run:" >&2
+    echo "  ./pipeline/tools/joint_offsets $*" >&2
+    exit 2
+fi
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PIPELINE="$(dirname "$HERE")"
+WORKSPACE="$(dirname "$PIPELINE")"
+POSE_REFINEMENT="${PIPELINE_POSE_REFINEMENT:-$(sed -n 's/^ *pose_refinement: *\([^ #]*\).*/\1/p' "$PIPELINE/config/pipeline.yaml" | head -1)}"
+POSE_REFINEMENT="${POSE_REFINEMENT/#\~/$HOME}"
+[[ "$POSE_REFINEMENT" == /* ]] || POSE_REFINEMENT="$WORKSPACE/$POSE_REFINEMENT"
+PY="${PIPELINE_PYTHON:-$POSE_REFINEMENT/.venv/bin/python}"
+if [[ ! -x "$PY" ]]; then
+    echo "no interpreter at $PY (set PIPELINE_PYTHON or PIPELINE_POSE_REFINEMENT)" >&2
+    exit 2
+fi
+cd "$WORKSPACE"
+PYTHONPATH="$PIPELINE${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" "$HERE/calibrate_joint_offsets.py" "$@"

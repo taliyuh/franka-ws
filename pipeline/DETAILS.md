@@ -100,6 +100,18 @@ sudo cp /tmp/99-obsensor-libusb.rules /etc/udev/rules.d/ && sudo udevadm control
 **eye_in_hand.** Finds where the camera sits on the wrist, using the board
 as the target. The board must stay still for the whole stage.
 
+Camera parameters and joint offsets come from `eye_in_hand.base_calibration`
+in `config/pipeline.yaml` (2026-11-19: AprilGrid intrinsics, fx 1848.9, and the
+`tools/joint_offsets` result, J2–J6). A new session copies them into its
+`config.yaml`, and `calibrate` keeps them fixed: `bundle` only refines the view
+poses, `solve` fits only the camera mount and the board around them (scale and
+sag are off by default; add them to `calibrate.model` to fit them).
+`--fit-intrinsics` estimates fx fy cx cy from the board views instead
+(`calibrate.bundle_free`), and `--fit-joint-offsets` estimates the joint 2-5
+offsets (model term `off`). If those steps are already done, add `--from fit` or
+`--from solve`. `calibration.json` → `source` says which was used. Sessions
+without `base_calibration` (from before 2026-11-19) fit both, as before.
+
 1. `look`: moves to the look pose (`config/azure_look_pose.yaml`) and grabs one RGB-D frame.
    `--here` skips the move and uses the current arm pose. The look pose comes
    from the FR3 cell; check the board is fully in view on the Panda and
@@ -135,11 +147,7 @@ as the target. The board must stay still for the whole stage.
    (J5 = 18 mrad on 2026-11-16) means the fit absorbed something else, so
    recalibrate. The board pose fitted along the way is
    written to `board_pose.json`, so `check`/`probe` can run straight away as
-   long as the board has not moved. **Temporary test hack:** the board written
-   there is moved 3 mm along −x of the base, toward the robot
-   (`CALIBRATE_BOARD_SHIFT_BASE_M` in `eye_in_hand.py`; set it to 0 to turn it
-   off). The fitted pose is kept as `T_base_board_fitted`. `locate` does not
-   shift.
+   long as the board has not moved. A test shift of the written board (`CALIBRATE_BOARD_SHIFT_BASE_M` in `eye_in_hand.py`) is off (0); when set, the fitted pose is kept as `T_base_board_fitted`.
 
 **stationary.** Finds where each fixed camera is relative to the robot base.
 
@@ -343,7 +351,9 @@ peg tool `targets/<hole>_tool.yaml`; the uncorrected board is kept in it as
 arm configuration the host's IK picks. MoveIt, which the probe uses, solves
 the same TCP pose from the arm's current joints and can pick another elbow
 (on 2026-11-12 joint 1 differed by 25–117°), so at such a hole the correction
-is only approximate.
+is only approximate. `--no-joint-correction` (`check`/`probe`/`tip`/`accuracy`)
+skips the correction and drives to the board pose as calibrated; it still
+prints the shift it skipped.
 
 `pipeline holes` lists the hole names (`<shape>_c<clearance>mm`, e.g.
 `hexagon_c0p2mm`) with board coordinates. Once a session has a board pose, it

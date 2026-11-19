@@ -48,23 +48,26 @@ GRAVITY = np.array([0, 0, -1.0])
 # `calibrate` writes board_pose.json with the board moved by this in panda_link0
 # (-x: toward the base). calibration.json keeps the fitted pose unshifted, and
 # `locate` does not shift. Set to 0.0 to turn it off.
-CALIBRATE_BOARD_SHIFT_BASE_M = np.array([-0.003, 0.0, 0.0])
+CALIBRATE_BOARD_SHIFT_BASE_M = np.array([0.0, 0.0, 0.0])   # off (was -0.003 on 2026-11-16..18)
 
 
 # ================================================================ chain model
-def chain_model(terms):
+def chain_model(terms, dq0=None):
     """(parameter count, fit, error, unpack) for a set of chain error terms.
 
-    off   encoder offsets joints 2-5
+    off   encoder offsets joints 2-5 (fitted on top of dq0)
     scale camera translation scale
     sag   camera rotation proportional to gravity in the link6 frame
+
+    dq0 are fixed joint offsets (all 7 joints), e.g. from base_calibration.
     """
     n = 12 + 4 * ("off" in terms) + ("scale" in terms) + 3 * ("sag" in terms)
+    fixed = np.zeros(7) if dq0 is None else np.asarray(dq0, float)
 
     def unpack(v):
-        i, dq, s, c = 12, np.zeros(7), 1.0, np.zeros(3)
+        i, dq, s, c = 12, fixed.copy(), 1.0, np.zeros(3)
         if "off" in terms:
-            dq[1:5] = v[i:i + 4]
+            dq[1:5] += v[i:i + 4]
             i += 4
         if "scale" in terms:
             s = 1 + v[i]
@@ -93,8 +96,9 @@ def chain_model(terms):
 
 
 def model_terms(values) -> tuple:
-    """Validated chain terms; an unquoted `off` in YAML arrives as False."""
-    terms = tuple("off" if v is False else str(v) for v in values)
+    """Validated chain terms; an unquoted `off` in YAML arrives as False, and a `model:`
+    whose items are all commented out arrives as None (no terms: camera mount and board only)."""
+    terms = tuple("off" if v is False else str(v) for v in (values or ()))
     unknown = set(terms) - {"off", "scale", "sag"}
     if unknown:
         raise PipelineError(f"unknown chain model terms {sorted(unknown)}; use off, scale, sag")
@@ -458,13 +462,34 @@ def _load_views(directory: Path, max_mad: float) -> list[dict]:
     return views
 
 
+def base_calibration(ctx: Context):
+    """(intrinsics, joint offsets) that `calibrate` keeps fixed, from eye_in_hand.base_calibration.
+
+    Each is None when the session config has none (sessions from before
+    2026-11-19), or when `--fit-intrinsics` / `--fit-joint-offsets` asks to
+    estimate it from the board views instead.
+    """
+    base = _settings(ctx).get("base_calibration") or {}
+    intr, dq = base.get("intrinsics"), base.get("joint_offsets_rad")
+    if intr is None or getattr(ctx.args, "fit_intrinsics", False):
+        intr = None
+    else:
+        intr = np.array([float(intr[name]) for name in rimfit.INTRINSIC_NAMES])
+    if dq is None or getattr(ctx.args, "fit_joint_offsets", False):
+        dq = None
+    else:
+        dq = np.array([float(dq.get(name, 0.0)) for name in panda.JOINT_NAMES])
+    return intr, dq
+
+
 def make_steps(stage: str) -> list[Step]:
     calibrating = stage == "calibrate"
 
     def camera_model(ctx):
         """(intrinsics, rim bias) used for fitting in this stage."""
         if calibrating:
-            return None, None      # factory intrinsics from the capture, no rim bias
+            # base_calibration's intrinsics, else the factory ones from the capture; no rim bias
+            return base_calibration(ctx)[0], None
         cal = _calibration(ctx)
         return cal.intrinsics, cal.rim_bias
 
@@ -601,9 +626,14 @@ def make_steps(stage: str) -> list[Step]:
         views = sorted(d for d in ctx.step_dir(stage, "fit").iterdir() if (d / "board_fit.json").exists())
         intr0, _ = rimfit.read_camera_info(views[0])
         rimfit.load(ctx.cfg)
-        print(f"  {len(views)} views, refining {', '.join(_settings(ctx)['calibrate']['bundle_free'])} "
-              "(several minutes)")
-        result = rimfit.bundle(views, intr0, _settings(ctx)["calibrate"]["bundle_free"], out)
+        # The fit step wrote base_calibration's intrinsics into the views when they
+        # are used; then they stay fixed and only the view poses and rim bias move.
+        fixed = base_calibration(ctx)[0] is not None
+        free = [] if fixed else _settings(ctx)["calibrate"]["bundle_free"]
+        print(f"  {len(views)} views, " + (f"intrinsics fixed (base_calibration, fx {intr0[0]:.1f}); refining "
+                                           "the view poses" if fixed else f"refining {', '.join(free)}")
+              + " (several minutes)")
+        result = rimfit.bundle(views, intr0, free, out)
         (out / "intrinsics.json").write_text(json.dumps(result, indent=2))
 
     def solve_calibration(ctx: Context, out: Path) -> None:
@@ -611,9 +641,14 @@ def make_steps(stage: str) -> list[Step]:
         bundled = ctx.step_dir(stage, "bundle")
         views = _load_views(bundled, e["max_mad_px"])
         terms = model_terms(e["calibrate"]["model"])
+        intr_fixed, dq_fixed = base_calibration(ctx)
+        if dq_fixed is not None:
+            terms = tuple(term for term in terms if term != "off")
+            print("  joint offsets fixed (base_calibration, mrad): "
+                  + " ".join(f"J{k + 1} {dq_fixed[k] * 1000:+.2f}" for k in range(7) if dq_fixed[k]))
         prior = ctx.cfg.path(e["prior_handeye"])
         x_seed = np.asarray(json.loads(prior.read_text())["matrix"])
-        n, fit_chain, error, unpack = chain_model(terms)
+        n, fit_chain, error, unpack = chain_model(terms, dq_fixed)
         base0 = panda.fk(views[0]["q"], "panda_link6") @ x_seed @ views[0]["cam_board"]
         print(f"  fitting {'+'.join(terms) or 'X only'} on {len(views)} views, then leave-one-out")
         v = fit_chain(views, np.r_[panda.to_vec(x_seed), panda.to_vec(base0), np.zeros(n - 12)])
@@ -638,7 +673,11 @@ def make_steps(stage: str) -> list[Step]:
                         "loo_p90_mm": float(np.percentile(loo, 90)),
                         "loo_max_mm": float(loo.max()),
                         "per_view_loo_mm": dict(zip([w["name"] for w in views], loo.round(4).tolist()))},
-            "source": {"prior_handeye": str(prior), "prior_sha256": sha256(prior)},
+            "source": {"prior_handeye": str(prior), "prior_sha256": sha256(prior),
+                       "intrinsics": ("base_calibration " + str(e["base_calibration"].get("intrinsics_source", ""))
+                                      if intr_fixed is not None else "bundle: " + ", ".join(intr["free"]) + " fitted"),
+                       "joint_offsets": ("base_calibration " + str(e["base_calibration"].get("joint_offsets_source", ""))
+                                         if dq_fixed is not None else ("fitted" if "off" in terms else "none"))},
         }
         text = json.dumps(calibration, indent=2)
         (out / CALIBRATION).write_text(text)
@@ -758,7 +797,7 @@ def corner_distance_mm(a, b):
 
 
 # ============================================================== hole targets
-def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
+def hole_target(session, cfg, hole: dict, name: str, tool, joint_correction: bool = True) -> Path:
     """Board pose for probe_board, corrected for the joint offsets at this hole.
 
     probe_board / MoveIt use the nominal Panda kinematics, but the real arm sits
@@ -770,6 +809,8 @@ def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
         C = FK(q_true - dq) @ inv(FK(q_true))     T_nominal_board = C @ T_base_board
 
     C depends (weakly) on the configuration, hence one target file per hole.
+    With joint_correction=False (`--no-joint-correction`) the board pose is
+    written as calibrated; C is only computed to print the shift that is skipped.
     """
     cal = Calibration.load(session.require(CALIBRATION, "run `pipeline calibrate` first"))
     board_file = session.require(BOARD_POSE, "run `pipeline locate` first")
@@ -798,8 +839,14 @@ def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
         raise PipelineError(f"no IK solution over {name} (residual {residual:.2e})")
     correction = panda.fk(q_true - cal.dq, "panda_hand_tcp") @ np.linalg.inv(panda.fk(q_true, "panda_hand_tcp"))
     shift = (correction @ np.r_[tip[:3], 1])[:3] - tip[:3]
-    print(f"joint-offset correction at {name}: tip shift {np.round(shift * 1e3, 2)} mm, "
-          f"rotation {math.degrees(Rotation.from_matrix(correction[:3, :3]).magnitude()):.3f} deg")
+    rotation = math.degrees(Rotation.from_matrix(correction[:3, :3]).magnitude())
+    if joint_correction:
+        print(f"joint-offset correction at {name}: tip shift {np.round(shift * 1e3, 2)} mm, "
+              f"rotation {rotation:.3f} deg")
+    else:
+        print(f"joint-offset correction at {name}: OFF (--no-joint-correction); the calibrated dq "
+              f"would shift the tip {np.round(shift * 1e3, 2)} mm, rotation {rotation:.3f} deg")
+        correction = np.eye(4)
 
     out = session.path / "targets" / f"{name}.json"
     out.parent.mkdir(exist_ok=True)
@@ -808,8 +855,11 @@ def hole_target(session, cfg, hole: dict, name: str, tool) -> Path:
         "board_surface_z_m": SURFACE_Z,
         "T_base_board": (correction @ board).tolist(),
         "source": {"setup": "eye_in_hand", "hole": name,
-                   "method": "board pose in the nominal-FK frame, joint-offset corrected at this hole",
+                   "method": ("board pose in the nominal-FK frame, joint-offset corrected at this hole"
+                              if joint_correction else
+                              "board pose as calibrated, joint-offset correction off (--no-joint-correction)"),
+                   "joint_correction": joint_correction,
                    "board_pose": str(board_file), "board_pose_sha256": sha256(board_file),
                    "T_base_board_true_frame": board.tolist(),
-                   "q_command_rad": (q_true - cal.dq).tolist()}}, indent=2))
+                   "q_command_rad": (q_true - (cal.dq if joint_correction else 0.0)).tolist()}}, indent=2))
     return out

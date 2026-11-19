@@ -45,7 +45,7 @@ Keep the e-stop at hand whenever the arm moves.
 | command | what it does |
 |---|---|
 | `new --setup eye_in_hand` | start a session (a folder in `sessions/`) |
-| `calibrate` | where the camera sits on the wrist; also measures the board |
+| `calibrate` | where the camera sits on the wrist; also measures the board. Camera parameters and joint offsets come from the config (`--fit-intrinsics`, `--fit-joint-offsets` estimate them instead) |
 | `locate` | measure the board again after it moved |
 | `holes` | list the hole names |
 | `grasp SHAPE` / `release` | close the hand on a peg / open it |
@@ -70,9 +70,6 @@ Everything goes to `sessions/<name>/`: `calibration.json`, `board_pose.json`
 | redo a step and what follows | `--from STEP` |
 | start a stage over | `--fresh` |
 | the board moved | `locate --fresh` |
-
-**Temporary:** `calibrate` writes the board 3 mm closer to the base than it
-measured (`CALIBRATE_BOARD_SHIFT_BASE_M` in `board_pipeline/eye_in_hand.py`).
 
 ## When something goes wrong
 

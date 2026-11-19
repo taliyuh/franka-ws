@@ -98,6 +98,7 @@ def cmd_stage(cfg: Config, args) -> None:
     else:
         stale = (BOARD_POSE, "targets")
     print(f"session {session.name} ({setup})")
+    _base_calibration_note(session, args)
     context = Context(session, session.cfg, args)
     finished = run_stage(context, args.command, _steps(setup, args.command), args.fresh,
                          args.from_step, on_rerun=lambda: session.invalidate(*stale),
@@ -109,6 +110,31 @@ def cmd_stage(cfg: Config, args) -> None:
         nxt = ("pipeline check --hole <name>` if the board has not moved, else `pipeline locate"
                if (session.path / BOARD_POSE).exists() else "pipeline locate")
     print(f"\n{args.command} finished. Next: `{nxt}`")
+
+
+def _base_calibration_note(session: Session, args) -> None:
+    """Say where calibrate's camera parameters and joint offsets come from, and when a --fit flag
+    would not reach the step it changes."""
+    if args.command != "calibrate" or session.cfg.setup != "eye_in_hand":
+        return
+    base = session.cfg["eye_in_hand"].get("base_calibration") or {}
+    for flag, key, step, what in (("fit_intrinsics", "intrinsics", "fit", "camera parameters"),
+                                  ("fit_joint_offsets", "joint_offsets_rad", "solve", "joint offsets")):
+        fitting = getattr(args, flag, False)
+        if key not in base:
+            source = "fitted from the board views (this session's config has no base_calibration)"
+        elif fitting:
+            source = f"fitted from the board views (--{flag.replace('_', '-')})"
+        else:
+            source = f"fixed from base_calibration ({base.get(key.replace('_rad', '') + '_source', 'config')})"
+        print(f"  {what}: {source}")
+        steps = [s.name for s in _steps(session.cfg.setup, "calibrate")]
+        index = steps.index(step) + 1
+        done = step_status(session.path / "calibrate", index, _steps(session.cfg.setup, "calibrate")[index - 1])
+        rerun = args.fresh or (args.from_step in steps[:index])
+        if fitting and done.startswith("done") and not rerun:
+            print(f"  note: `{step}` is already done, so --{flag.replace('_', '-')} changes nothing; "
+                  f"add --from {step}")
 
 
 def cmd_holes(cfg: Config, args) -> None:
@@ -149,7 +175,7 @@ def _print_turns(tool, candidates, start) -> None:
 
 
 def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None, height_mm: float,
-                  turn_deg: float = 0.0):
+                  turn_deg: float = 0.0, joint_correction: bool = True):
     """Write one hole's target and tool files; returns (tool, tip source, target file, probe_board argv)."""
     if name not in holes:
         raise PipelineError(f"unknown hole {name!r}; `pipeline holes` lists them")
@@ -171,7 +197,8 @@ def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None
     print(f"held peg: {tool.shape} in the V-block fingers (grasp width {tool.grasp_width_mm:.2f} mm), "
           f"peg yaw {math.degrees(tool.peg_yaw):.2f} deg on the board, "
           f"tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP ({tip_source})")
-    target = _module(session.cfg.setup).hole_target(session, session.cfg, hole, name, tool)
+    target = _module(session.cfg.setup).hole_target(session, session.cfg, hole, name, tool,
+                                                    joint_correction=joint_correction)
     manipulation = grasp.write_manipulation_config(
         session.cfg, tool, session.path / "targets" / f"{name}_tool.yaml")
     argv = ["--board-pose", ros.container_path(session.cfg, target),
@@ -184,7 +211,7 @@ def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None
 def cmd_probe(cfg: Config, args) -> None:
     session = Session.open(cfg, args.session)
     _, _, _, argv = _probe_target(session, _holes(session.cfg), args.hole, args.tip_from, args.height,
-                                  args.turn)
+                                  args.turn, joint_correction=not args.no_joint_correction)
     if args.command == "check":
         argv.append("--dry-run")
     elif args.command == "tip":
@@ -343,7 +370,8 @@ def _probe_holes(session: Session, holes: dict, run: Path, plan: dict) -> None:
         if entry["shape"] != held:
             _hand_peg(session.cfg, entry["shape"], held)
             held = entry["shape"]
-        tool, tip_source, target, argv = _probe_target(session, holes, name, plan["tip_from"], plan["height_mm"])
+        tool, tip_source, target, argv = _probe_target(session, holes, name, plan["tip_from"], plan["height_mm"],
+                                                       joint_correction=plan.get("joint_correction", True))
         entry.update(tip_offset_tcp_mm=[round(float(v) * 1000.0, 3) for v in tool.tip_offset],
                      tip_source=tip_source.split(";")[0],
                      correction_mm=_correction_mm(target, tool, plan["height_mm"]), target=str(target))
@@ -369,7 +397,7 @@ def cmd_accuracy(cfg: Config, args) -> None:
             raise PipelineError("--resume continues the saved list of holes; give no holes with it")
         run = _accuracy_run(session, args.resume)
         plan = load_yaml(run / ACCURACY_PLAN)
-        print(f"resuming {run} (its --height and --tip-from)")
+        print(f"resuming {run} (its --height, --tip-from and joint correction)")
     else:
         names = args.holes or list(ACCURACY_HOLES)
         unknown = [name for name in names if name not in holes]
@@ -379,6 +407,7 @@ def cmd_accuracy(cfg: Config, args) -> None:
         run = session.path / "accuracy" / now.strftime("%Y-%m-%d_%H%M%S")
         plan = {"session": session.name, "created": now.isoformat(timespec="seconds"),
                 "height_mm": args.height, "tip_from": args.tip_from,
+                "joint_correction": not args.no_joint_correction,
                 "holes": [{"name": name, "shape": holes[name]["shape"],
                            "clearance_mm": holes[name]["clearance_mm"]} for name in names]}
         run.mkdir(parents=True)
@@ -443,6 +472,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--here", action="store_true",
                        help="eye_in_hand: use the current arm pose instead of the look pose")
         p.add_argument("--yes", action="store_true", help="do not ask before moving the arm")
+        if stage == "calibrate":
+            p.add_argument("--fit-intrinsics", action="store_true",
+                           help="eye_in_hand: estimate fx fy cx cy from the board views (bundle) instead of "
+                                "using eye_in_hand.base_calibration's camera parameters")
+            p.add_argument("--fit-joint-offsets", action="store_true",
+                           help="eye_in_hand: estimate joint 2-5 offsets from the board views (model term "
+                                "\"off\") instead of using eye_in_hand.base_calibration's offsets")
         p.set_defaults(func=cmd_stage)
 
     for command, text in (("check", "dry run: validate the target and IK, no motion"),
@@ -459,6 +495,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="turn the hand this much further about the peg axis than the automatic choice "
                             "(a multiple of the peg's symmetry; any angle for the round peg). "
                             "`pipeline diag 3` is the measured version")
+        p.add_argument("--no-joint-correction", action="store_true",
+                       help="drive to the board pose as calibrated, without the per-hole joint-offset shift "
+                            "(eye_in_hand; compare with the corrected landing)")
         if command == "tip":
             p.add_argument("--watch", action="store_true",
                            help="keep printing twice a second until Ctrl-C (also while hand-guiding)")
@@ -507,6 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where the descent ends: tip height above the board surface, mm "
                         "(default 0: the tip at the surface, in the mouth of the hole)")
     p.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    p.add_argument("--no-joint-correction", action="store_true",
+                   help="drive to the board pose as calibrated, without the per-hole joint-offset shift "
+                        "(eye_in_hand; compare with the corrected landing)")
     p.add_argument("--resume", nargs="?", const="latest", metavar="DIR",
                    help="probe the holes an interrupted run did not finish (default: the newest run)")
     p.add_argument("--plot", nargs="?", const="latest", metavar="DIR",

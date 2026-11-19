@@ -7,6 +7,8 @@ log/
 # Pipeline sessions: 4K captures, fits, calibrations. Measurements, not code.
 sessions/
 repeatability/
+# Hand-held camera calibrations (pipeline/tools/calibrate_azure_intrinsics.py): 4K images.
+camera_calibration/
 
 # ------------------------------------------------------- upstream packages
 # Panda / Noetic: franka_ros, panda_moveit_config, the Azure Kinect and Orbbec
