@@ -17,6 +17,7 @@ catkin_install_python(PROGRAMS
   scripts/pivot_calibration
   scripts/measure_repeatability
   scripts/plot_probe_accuracy
+  scripts/set_load
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 install(DIRECTORY config launch

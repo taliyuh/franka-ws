@@ -18,6 +18,13 @@
   <arg name="load_gripper" default="true" />
   <arg name="moveit" default="true" doc="start move_group for /compute_ik" />
   <arg name="use_rviz" default="false" />
+  <!-- Payload on the flange (hand + camera + fingers), sent to franka_control
+       once the controller is up, together with NE_T_EE = identity (the robot
+       restores a stored peg-tip NE_T_EE on each connection; the tools need the
+       Franka Hand TCP). set_load:=false keeps whatever Desk has for both. -->
+  <arg name="set_load" default="true" />
+  <arg name="load_mass" default="0.68" />
+  <arg name="load_com" default="[0.02, -0.10, -0.12]" />
   <!-- franka_state_controller rate: measured joints for settle detection and
        image bracketing, and FrankaState (O_T_EE) for the Cartesian checks.
        franka_control's default is 30 Hz. -->
@@ -30,6 +37,13 @@
   <!-- default_controllers.yaml (loaded by franka_control.launch) defines it. -->
   <node name="position_trajectory_spawner" pkg="controller_manager" type="spawner"
         respawn="false" output="screen" args="position_joint_trajectory_controller" />
+
+  <node if="$(arg set_load)" name="set_load" pkg="panda_calibration" type="set_load"
+        output="screen">
+    <param name="mass" value="$(arg load_mass)" />
+    <rosparam param="center_of_mass" subst_value="true">$(arg load_com)</rosparam>
+    <rosparam param="inertia">[0.001, 0, 0, 0, 0.001, 0, 0, 0, 0.001]</rosparam>
+  </node>
 
   <!-- move_group as panda_moveit_config's franka_control.launch starts it, but
        with RViz optional (that launch file always opens it). -->
