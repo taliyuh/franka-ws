@@ -1,14 +1,15 @@
 # Joint pose the arm moves to before taking the seed RGB-D view (eye_in_hand).
-# The board must be fully visible from here. Taken from the 2026-10-12 FR3
-# session; inside the Panda's joint limits too (same kinematics), but check the
-# view on the Panda cell and replace it (`pipeline locate --here` helps).
+# The board must be fully visible from here. Derived from the 2026-10-12 FR3
+# look pose: same camera x/y and roll, raised 10 cm (camera ~0.655 m above the
+# base plane) with the optical axis straight down (prior hand-eye, joint 7
+# unchanged). Replace it (`pipeline locate --here` helps) if the view is off.
 joint_names: [panda_joint1, panda_joint2, panda_joint3, panda_joint4, panda_joint5, panda_joint6, panda_joint7]
 poses:
 - joints:
-  - 0.115298
-  - 0.283415
-  - 0.010795
-  - -1.555935
-  - -0.151987
-  - 1.869074
+  - -0.097501
+  - 0.351243
+  - 0.286477
+  - -1.168552
+  - -0.021379
+  - 1.493517
   - -0.677669
