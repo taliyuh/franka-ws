@@ -12,12 +12,13 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from board_pipeline import diagnose, eye_in_hand, grasp, ros, stationary
+from board_pipeline import diagnose, eye_in_hand, grasp, panda, ros, stationary
 from board_pipeline.config import SETUPS, Config, PipelineError, load_yaml
 from board_pipeline.session import (BOARD_POSE, CALIBRATION, REUSED, Context, Session,
                                     run_stage, step_status)
 
 STAGES = ("calibrate", "locate")
+LIMIT_WARNING_RAD = 0.1    # warn when a planned joint is this close to its limit
 
 
 def _module(setup: str):
@@ -174,6 +175,16 @@ def _print_turns(tool, candidates, start) -> None:
         print(f"  {mark} turn {math.degrees(option.turn):+7.1f} deg: {j7}")
 
 
+def _planned_joints(target, tool):
+    """The joints the arm is meant to have at the hole, as commanded (nominal) angles.
+
+    eye_in_hand writes them to the target file (the joint-offset correction is
+    only valid there); otherwise they are the ones choose_turn predicted.
+    """
+    planned = json.loads(target.read_text()).get("source", {}).get("q_command_rad")
+    return np.asarray(planned, float) if planned is not None else tool.joints
+
+
 def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None, height_mm: float,
                   turn_deg: float = 0.0, joint_correction: bool = True):
     """Write one hole's target and tool files; returns (tool, tip source, target file, probe_board argv)."""
@@ -182,8 +193,8 @@ def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None
     hole = holes[name]
     board = np.asarray(json.loads(session.require(BOARD_POSE, "run `pipeline locate` first")
                                   .read_text())["T_base_board"])
-    # The wrist turn is measured from where the arm stands now (probe_board's
-    # IK starts there); without a robot state, joint 7 is kept near mid-range.
+    # The wrist turn is measured from where the arm stands now; without a
+    # robot state, joint 7 is kept near mid-range.
     start = ros.current_joints(session.cfg)
     tool, candidates = grasp.choose_turn(session.cfg, hole, name, board,
                                          None if start is None else np.asarray(start))
@@ -205,6 +216,17 @@ def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None
             "--offset", float(tool.point[0]), float(tool.point[1]), height_mm / 1000.0,
             "--config", ros.container_path(session.cfg, session.cfg.path(session.cfg["robot"]["config"])),
             "--manipulation-config", ros.container_path(session.cfg, manipulation)]
+    # probe_board starts its IK at the planned joints and refuses a solution
+    # in another posture: MoveIt, seeded at the current joints, has reached
+    # holes with joint 1 on its limit and the shoulder flipped, where neither
+    # the wrist margin nor the joint-offset correction computed here holds.
+    planned = _planned_joints(target, tool)
+    if planned is not None:
+        margin = np.minimum(planned - panda.LOWER, panda.UPPER - planned)
+        for index in np.flatnonzero(margin < LIMIT_WARNING_RAD):
+            print(f"warning: the planned posture has joint {index + 1} only {margin[index]:.2f} rad "
+                  "from its limit; start from a pose nearer the look pose if the move stops there")
+        argv += ["--ik-seed", *(float(v) for v in planned)]
     return tool, tip_source, target, argv
 
 

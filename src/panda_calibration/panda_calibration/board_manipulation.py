@@ -11,6 +11,12 @@ With ``--record FILE`` (``pipeline accuracy``) every attempt of every move is
 written to FILE: the commanded TCP pose and joints and where the arm settled
 (see probe_accuracy.py). The arm then also holds at the bottom when the descent
 reaches the target, for photos, and asks for a note before it retracts.
+
+The Panda is redundant, so one TCP pose has many joint solutions. ``--ik-seed``
+names the one the caller planned for (``pipeline check/probe`` pass the joints
+their board target was corrected at): every IK starts there and must stay
+within ``--max-posture-change`` of the previous solution, so the arm cannot
+flip its shoulder or wind joints 1 and 3 to their limits on the way to a hole.
 """
 
 from __future__ import annotations
@@ -82,6 +88,12 @@ def pen_tip_report(tcp_pose: np.ndarray, pen_tip_offset, board_transform: np.nda
             f'{abs(rel[2]) * 1000:.2f} mm {height} it')
 
 
+def posture_change(joints, reference) -> float:
+    """Largest single-joint difference (rad) between two joint solutions."""
+    return float(np.max(np.abs(np.asarray(joints, dtype=float)
+                               - np.asarray(reference, dtype=float))))
+
+
 def validate_probe_motion_config(config: dict) -> None:
     """Require the joint *position* trajectory controller for real board probing.
 
@@ -117,6 +129,12 @@ class BoardManipulation:
         self.kinematic_chain = None
         self.use_moveit_ik = False
         self.recorder = None   # probe_accuracy.Recorder with --record
+        # The joint solution every IK must stay near: --ik-seed at first, then
+        # the last accepted solution. None (a plain run without --ik-seed)
+        # leaves the first IK free, seeded at the current joints as before.
+        seed = getattr(args, 'ik_seed', None)
+        self.posture = None if seed is None else np.asarray(seed, dtype=float)
+        self.max_posture_change = float(getattr(args, 'max_posture_change', 0.5))
 
     def shutdown(self) -> None:
         self.driver.shutdown()
@@ -205,30 +223,73 @@ class BoardManipulation:
         return pose if pose is not None else self.current_tcp_pose(base_frame)
 
     def solve_ik(self, pose: np.ndarray, frame_id: str) -> list[float]:
+        """Joint solution for a TCP pose, kept near the reference posture.
+
+        The reference is ``--ik-seed`` for the first solve and the previous
+        solution afterwards. MoveIt's KDL solver restarts from random joints
+        when it fails from its seed and then returns any branch (2026-11-05:
+        joint 1 on its +2.897 limit, where the planned solution had -0.35), so
+        a solution farther than ``--max-posture-change`` from the reference is
+        not used: the local IK finds the nearby one and MoveIt, seeded with it,
+        has to confirm it (joint limits, collisions).
+        """
+        reference = self.posture
+        seed = self.driver.positions if reference is None else reference
+        if seed is None:
+            raise RuntimeError('current joint state is unavailable')
+
         if not self.use_moveit_ik:
+            joints = self._local_ik(pose, seed, restarts=reference is None)
+        else:
+            joints = self._moveit_ik(pose, frame_id, seed)
+            if reference is not None and \
+                    posture_change(joints, reference) > self.max_posture_change:
+                rospy.logwarn(
+                    f'MoveIt IK left the planned posture (a joint differs by '
+                    f'{posture_change(joints, reference):.2f} rad); solving next to it instead')
+                nearby = self._local_ik(pose, reference, restarts=False)
+                joints = self._moveit_ik(pose, frame_id, nearby)
+        if reference is not None:
+            change = posture_change(joints, reference)
+            if change > self.max_posture_change:
+                raise RuntimeError(
+                    f'no usable IK solution near the planned posture: the nearest one moves a '
+                    f'joint by {change:.2f} rad (limit {self.max_posture_change:.2f} rad); the '
+                    'nearby solution is at a joint limit or in collision. Move the arm closer '
+                    'to the hole (or the board away from the limit) and run it again')
+            rospy.loginfo(f'IK: largest joint change from the planned posture {change:.3f} rad')
+        self.posture = np.asarray(joints, dtype=float)
+        return [float(value) for value in joints]
+
+    def _local_ik(self, pose: np.ndarray, seed, restarts: bool) -> list[float]:
+        chain = self.local_chain or self.kinematic_chain
+        if restarts:
             motion = self.config['motion']
-            joints, converged = self.local_chain.ik_with_restarts(
+            joints, converged = chain.ik_with_restarts(
                 pose,
-                seed=self.driver.positions,
+                seed=seed,
                 position_tolerance=float(motion.get('max_cartesian_position_error_m', 1e-4)),
                 rotation_tolerance=float(motion.get('max_cartesian_rotation_error_rad', 8.0e-4)),
             )
-            if not converged:
-                raise RuntimeError('local IK could not solve this pose')
-            return [float(value) for value in joints]
+        else:
+            # Next to a planned posture: no restarts, and the redundant degree
+            # of freedom is pulled towards that posture, not towards READY.
+            joints, converged = chain.ik(
+                pose, seed, nullspace_target=seed,
+                position_tolerance=2.0e-5, rotation_tolerance=1.0e-4)
+        if not converged:
+            raise RuntimeError('local IK could not solve this pose'
+                               + ('' if restarts else ' near the planned posture'))
+        return [float(value) for value in joints]
 
+    def _moveit_ik(self, pose: np.ndarray, frame_id: str, seed) -> list[float]:
         request = GetPositionIKRequest()
         request.ik_request.group_name = self.args.move_group
         request.ik_request.timeout = rospy.Duration(0.5)
         request.ik_request.ik_link_name = self.args.ik_link
         request.ik_request.avoid_collisions = True
-        current_positions = self.driver.positions
-        if current_positions is None:
-            raise RuntimeError('current joint state is unavailable')
         request.ik_request.robot_state.joint_state.name = list(self.joint_names)
-        request.ik_request.robot_state.joint_state.position = [
-            float(value) for value in current_positions
-        ]
+        request.ik_request.robot_state.joint_state.position = [float(value) for value in seed]
         request.ik_request.pose_stamped = PoseStamped()
         request.ik_request.pose_stamped.header.frame_id = frame_id
         target = request.ik_request.pose_stamped.pose
@@ -375,6 +436,13 @@ def main(argv=None) -> int:
     parser.add_argument('--ik-link', default='panda_hand_tcp')
     parser.add_argument('--staging-z', type=float, default=None,
                         help='fixed TCP Z in the base frame for the XY phase')
+    parser.add_argument('--ik-seed', nargs=7, type=float, default=None,
+                        metavar=('J1', 'J2', 'J3', 'J4', 'J5', 'J6', 'J7'),
+                        help='joint solution (rad) planned for the target; the IK starts '
+                             'there and stays near it instead of at the current joints')
+    parser.add_argument('--max-posture-change', type=float, default=0.5, metavar='RAD',
+                        help='largest joint difference accepted between an IK solution and '
+                             'the previous one (--ik-seed for the first), default 0.5')
     parser.add_argument('--dry-run', action='store_true',
                         help='validate artifact and IK without sending trajectories')
     parser.add_argument('--yes', action='store_true',
@@ -409,6 +477,10 @@ def main(argv=None) -> int:
         if not (np.all(np.isfinite(orientation)) and np.all(np.isfinite(pen_tip_offset))
                 and np.all(np.isfinite(offset))):
             raise ValueError('offset and tool configuration values must be finite')
+        if args.ik_seed is not None and not np.all(np.isfinite(args.ik_seed)):
+            raise ValueError('--ik-seed joint angles must be finite')
+        if not (np.isfinite(args.max_posture_change) and args.max_posture_change > 0):
+            raise ValueError('--max-posture-change must be positive')
         approach_height = float(probe['approach_height_m'])
         segment = float(probe['descent_segment_m'])
         maximum = float(probe['max_descent_m'])
@@ -434,6 +506,12 @@ def main(argv=None) -> int:
         input('Press Enter to approach the point, or Ctrl-C to abort... ')
 
     rospy.init_node('board_manipulation', anonymous=True, disable_signals=True)
+    # The node log is the only record of a run: keep what was asked for in it.
+    rospy.loginfo(f'board pose {args.board_pose}, board offset [m] {list(args.offset)}')
+    rospy.loginfo(f'pen-tip target in base [m]: {np.round(board_point[:3], 5).tolist()}; '
+                  f'TCP target in base [m]: {np.round(target[:3, 3], 5).tolist()}')
+    if args.ik_seed is not None:
+        rospy.loginfo(f'planned posture (--ik-seed): {np.round(args.ik_seed, 4).tolist()}')
     node = BoardManipulation(config, args)
 
     def pen_tip() -> str:

@@ -13,8 +13,10 @@ from panda_calibration.board_pose import (
     validate_board_offset,
 )
 from panda_calibration.board_manipulation import (
+    BoardManipulation,
     compensate_pose_for_measured_error,
     pen_tip_report,
+    posture_change,
 )
 from panda_calibration.kinematics import (
     conservative_joint_tolerances,
@@ -158,6 +160,78 @@ class BoardManipulationGeometryTest(unittest.TestCase):
         below = tcp.copy()
         below[:3, 3] -= board[:3, 2] * 0.0005
         self.assertIn('0.50 mm below it', pen_tip_report(below, offset, board, target))
+
+
+class _FakeChain:
+    """Stands in for kinematics.Chain: returns the seed, shifted a little."""
+
+    def ik(self, pose, seed, **_):
+        return np.asarray(seed, dtype=float) + 0.01, True
+
+    def ik_with_restarts(self, pose, seed=None, **_):
+        return np.asarray(seed, dtype=float) + 0.01, True
+
+
+class _Driver:
+    positions = np.zeros(7)
+
+
+def _node(moveit_answers, seed=None, limit=0.5):
+    """A BoardManipulation whose MoveIt IK replays *moveit_answers* (no ROS)."""
+    node = BoardManipulation.__new__(BoardManipulation)
+    node.driver = _Driver()
+    node.config = {'motion': {}}
+    node.kinematic_chain = node.local_chain = _FakeChain()
+    node.use_moveit_ik = True
+    node.posture = None if seed is None else np.asarray(seed, dtype=float)
+    node.max_posture_change = limit
+    node.seeds = []
+    answers = iter(moveit_answers)
+
+    def moveit(pose, frame_id, ik_seed):
+        node.seeds.append(np.asarray(ik_seed, dtype=float))
+        answer = next(answers)
+        return list(ik_seed) if answer is None else list(answer)   # None: echo the seed
+    node._moveit_ik = moveit
+    return node
+
+
+PLANNED = np.array([-0.35, 0.24, 0.38, -2.65, -0.36, 2.86, -2.38])
+FLIPPED = np.array([2.897, -0.16, -2.83, -2.67, -0.19, 2.82, -2.51])   # logged 2026-11-05
+
+
+class PlannedPostureTest(unittest.TestCase):
+    def test_posture_change_is_the_largest_joint_difference(self):
+        self.assertAlmostEqual(posture_change(PLANNED, FLIPPED), 2.897 + 0.35)
+
+    def test_ik_starts_at_the_planned_joints_not_the_current_ones(self):
+        node = _node([None], seed=PLANNED)
+        joints = node.solve_ik(np.eye(4), 'panda_link0')
+        np.testing.assert_allclose(node.seeds[0], PLANNED)
+        np.testing.assert_allclose(joints, PLANNED)
+
+    def test_a_flipped_moveit_solution_is_replaced_by_the_nearby_one(self):
+        node = _node([FLIPPED, None], seed=PLANNED)
+        joints = node.solve_ik(np.eye(4), 'panda_link0')
+        np.testing.assert_allclose(joints, PLANNED + 0.01)      # local IK, confirmed by MoveIt
+        np.testing.assert_allclose(node.seeds[1], PLANNED + 0.01)
+
+    def test_refuses_when_moveit_rejects_the_nearby_solution_too(self):
+        node = _node([FLIPPED, FLIPPED], seed=PLANNED)
+        with self.assertRaisesRegex(RuntimeError, 'near the planned posture'):
+            node.solve_ik(np.eye(4), 'panda_link0')
+
+    def test_later_solves_follow_the_previous_solution(self):
+        node = _node([None, FLIPPED, FLIPPED], seed=PLANNED)
+        node.solve_ik(np.eye(4), 'panda_link0')
+        with self.assertRaises(RuntimeError):                    # no jump mid-descent
+            node.solve_ik(np.eye(4), 'panda_link0')
+
+    def test_without_a_seed_the_first_solve_is_free(self):
+        node = _node([FLIPPED])
+        joints = node.solve_ik(np.eye(4), 'panda_link0')
+        np.testing.assert_allclose(node.seeds[0], np.zeros(7))  # current joints, as before
+        np.testing.assert_allclose(joints, FLIPPED)
 
 
 if __name__ == '__main__':

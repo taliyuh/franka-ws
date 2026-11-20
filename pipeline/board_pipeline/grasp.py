@@ -158,7 +158,7 @@ def _solve(target: np.ndarray, seeds: list[np.ndarray], near: np.ndarray) -> np.
 
 
 def _predicted_joints(tools: list[Tool], board: np.ndarray, start: np.ndarray) -> list:
-    """Arm joints at the hole for each turn, as probe_board's IK (seeded at `start`) finds them.
+    """Arm joints at the hole for each turn, nearest `start`; probe_board's IK is seeded with them.
 
     Joint 7 turns about the TCP z axis, so turning the peg by `turn` about the
     board normal moves joint 7 by about turn * (TCP z . board z) and leaves the
