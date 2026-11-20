@@ -40,3 +40,29 @@ __pycache__/
 .DS_Store
 *.swp
 *~
+
+# ------------------------------------------- local measurements / experiments
+# Old runs and one-off scripts kept at the workspace root (not part of the
+# pipeline). Anchored to the root so same-named files elsewhere still show.
+/azure_eih_link6_calibration.json
+/azure_handeye_manual/
+/azure_handeye_replay/
+/azure_repeatability/
+/board_pose_robot*.json
+/calibration_0.0kg/
+/calibration_0.73kg/
+/calibration_diagnostics/
+/capture_panda_azure.py
+/captures/
+/fr3_ros_controllers_position.yaml
+/launch_info.txt
+/legacy/
+/manual_direct_joints_ptp.yaml
+/panda_azure_captures.txt
+/panda_azure_captures/
+/poses.txt
+/poses2.txt
+/repeat_abc_*
+/session_dual_20260910_ptp_for_astra/
+/session_mega_07.09__01_calibration.json
+/src/calibration_codex/
