@@ -22,11 +22,18 @@ import sys
 
 import actionlib
 import rospy
-from franka_gripper.msg import GraspAction, GraspEpsilon, GraspGoal, MoveAction, MoveGoal
+from actionlib_msgs.msg import GoalStatus, GoalStatusArray
+from franka_gripper.msg import (GraspAction, GraspEpsilon, GraspGoal, MoveAction, MoveGoal,
+                                StopAction, StopGoal)
 from sensor_msgs.msg import JointState
 
 GRASP_ACTION = '/franka_gripper/grasp'
 MOVE_ACTION = '/franka_gripper/move'
+STOP_ACTION = '/franka_gripper/stop'
+# Goal states in which franka_gripper is still inside libfranka's blocking call.
+# Cancelling does not interrupt that call: a timed-out grasp stays PREEMPTING
+# and every later grasp queues behind it until a stop goal ends it.
+BUSY_STATES = (GoalStatus.PENDING, GoalStatus.ACTIVE, GoalStatus.PREEMPTING, GoalStatus.RECALLING)
 GRIPPER_STATE = '/franka_gripper/joint_states'
 MAX_WIDTH = 0.08  # Franka Hand stroke, m
 RELEASE_HINT = ('release with `pipeline release`; do not run homing while holding a peg '
@@ -58,12 +65,43 @@ def _connect(name: str, action) -> actionlib.SimpleActionClient | None:
     return client
 
 
+def busy(action: str, timeout: float = 2.0) -> bool:
+    """True when *action* (e.g. GRASP_ACTION) still runs a goal, possibly another node's."""
+    try:
+        status = rospy.wait_for_message(action + '/status', GoalStatusArray, timeout=timeout)
+    except rospy.ROSException:
+        return False
+    return any(s.status in BUSY_STATES for s in status.status_list)
+
+
+def stop_hand(timeout: float = 5.0) -> bool:
+    """End whatever grasp or move the hand is running (the hand stops squeezing); True on success."""
+    client = _connect(STOP_ACTION, StopAction)
+    if client is None:
+        return False
+    client.send_goal(StopGoal())
+    if not client.wait_for_result(rospy.Duration(timeout)):
+        client.cancel_goal()
+        print(f'error: the hand did not stop within {timeout:g} s; restart robot.launch',
+              file=sys.stderr)
+        return False
+    result = client.get_result()
+    if result is None or not result.success:
+        print(f'error: stopping the hand failed ({getattr(result, "error", "") or "no result"})',
+              file=sys.stderr)
+        return False
+    return True
+
+
 def _run(client: actionlib.SimpleActionClient, goal, timeout: float, what: str):
-    """Send the goal and return its result, None (after cancelling) on timeout."""
+    """Send the goal and return its result, None on timeout (after stopping the hand)."""
     client.send_goal(goal)
     if not client.wait_for_result(rospy.Duration(timeout)):
         client.cancel_goal()
-        print(f'error: the {what} did not finish within {timeout:g} s; cancelled', file=sys.stderr)
+        # The cancel alone leaves franka_gripper blocked in the libfranka call.
+        stopped = stop_hand()
+        print(f'error: the {what} did not finish within {timeout:g} s; '
+              + ('cancelled and stopped the hand' if stopped else 'cancelled'), file=sys.stderr)
         return None
     return client.get_result()
 
@@ -83,6 +121,11 @@ def grasp(width: float, epsilon: float = 0.001, force: float = 20.0, speed: floa
     client = _connect(GRASP_ACTION, GraspAction)
     if client is None:
         return False
+    if busy(GRASP_ACTION) or busy(MOVE_ACTION):
+        # A grasp left over from an earlier, timed-out run: the new goal would only queue.
+        print('the hand is still running an earlier grasp or move; stopping it first')
+        if not stop_hand():
+            return False
     result = _run(client, GraspGoal(width=width, epsilon=GraspEpsilon(inner=epsilon, outer=outer),
                                     speed=speed, force=force), timeout, 'grasp')
     print(f'fingers at {_measured()} (accepted {(width - epsilon) * 1000:.2f} to '
@@ -127,6 +170,10 @@ def open_hand(width: float = 0.03, speed: float = 0.05, timeout: float = 10.0) -
     client = _connect(MOVE_ACTION, MoveAction)
     if client is None:
         return False
+    if busy(GRASP_ACTION) or busy(MOVE_ACTION):
+        print('the hand is still running an earlier grasp or move; stopping it first')
+        if not stop_hand():
+            return False
     result = _run(client, MoveGoal(width=width, speed=speed), timeout, 'release')
     print(f'fingers at {_measured()} (target {width * 1000:.2f} mm)')
     if result is None or not result.success:
