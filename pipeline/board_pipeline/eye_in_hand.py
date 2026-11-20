@@ -204,7 +204,11 @@ def robot_side_views(count, centre, normal, base_board, x, visible, clear, segme
     lo = np.maximum(panda.LOWER + p.limit_margin, ready - box)
     hi = np.minimum(panda.UPPER - p.limit_margin, ready + box)
     # READY turned about the base toward each side gives IK a start for the side views.
-    seeds = [np.r_[ready[0] + turn, ready[1:]] for turn in np.radians([0, 35, -35, 70, -70])]
+    # Each sample tries only the seed turned nearest to it: about 97% of samples
+    # are rejected, and trying all five seeds on each made this search take
+    # several minutes (2026-11-19: every accepted view came from the nearest seed).
+    seed_turns = np.radians([0, 35, -35, 70, -70])
+    seeds = [np.r_[ready[0] + turn, ready[1:]] for turn in seed_turns]
     ready_camera = panda.fk(ready, "panda_link6") @ x
 
     found = []   # (q, camera pose, tilt deg, azimuth deg)
@@ -227,12 +231,10 @@ def robot_side_views(count, centre, normal, base_board, x, visible, clear, segme
         cam[:3, :3] = np.c_[xa, np.cross(z, xa), z]
         cam[:3, 3] = cam_pos
         target = cam @ np.linalg.inv(x)
-        for s in seeds:
-            q, err = panda.ik_link6(target, s)
-            if err < 1e-4 and np.all(q[:6] >= lo[:6]) and np.all(q[:6] <= hi[:6]) and clear(q) \
-                    and camera_arm_clearance(q, x) >= CAMERA_ARM_CLEARANCE_M and visible(q):
-                found.append((q, cam, math.degrees(tilt), math.degrees(az)))
-                break
+        q, err = panda.ik_link6(target, seeds[int(np.argmin(np.abs(seed_turns - turn)))])
+        if err < 1e-4 and np.all(q[:6] >= lo[:6]) and np.all(q[:6] <= hi[:6]) and clear(q) \
+                and camera_arm_clearance(q, x) >= CAMERA_ARM_CLEARANCE_M and visible(q):
+            found.append((q, cam, math.degrees(tilt), math.degrees(az)))
         if len(found) >= max(15 * count, 60):
             break
     if not found:
