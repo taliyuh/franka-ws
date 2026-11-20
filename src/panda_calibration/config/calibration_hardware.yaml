@@ -111,6 +111,11 @@ motion:
   # detection need them.
   measured_tcp_pose_topic: /franka_state_controller/franka_states
   measured_tcp_pose_frame: panda_link0
+  # Robot mode and motion errors from the same FrankaState, independent of
+  # O_T_EE: with it, a reflex or user stop before or during a move aborts the
+  # move with its cause. Without it the arm can stand still in reflex mode
+  # while the tools keep sending goals and report an unchanging residual.
+  robot_state_topic: /franka_state_controller/franka_states
   max_joint_speed: 0.4      # rad/s, before --speed-scale
   min_duration: 2.0         # s, floor on any point-to-point move
   goal_time_tolerance: 0.5  # s the controller may overrun the trajectory end

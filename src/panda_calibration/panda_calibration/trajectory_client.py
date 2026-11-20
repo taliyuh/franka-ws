@@ -100,14 +100,28 @@ class ArmDriver:
             # longer updates the driver state.
             self._subscribers.append(rospy.Subscriber(
                 '/joint_states', JointState, self._on_fallback_joint_state, queue_size=10))
-        # franka_msgs/FrankaState: O_T_EE is the robot's own measured pose of
-        # the end-effector frame configured in Desk (Franka Hand: the hand TCP).
+        # franka_msgs/FrankaState carries two independent things:
+        #  * robot_mode / last_motion_errors: whether franka_control is moving
+        #    the arm at all (reflex, user stop). Read from ``robot_state_topic``.
+        #  * O_T_EE: the robot's own measured pose of the end-effector frame
+        #    configured in Desk or by libfranka's setEE (Franka Hand: the hand
+        #    TCP). Used only when ``measured_tcp_pose_topic`` is set.
+        # They are separate settings so that an end effector other than the
+        # Franka Hand (O_T_EE unusable) does not also switch off the reflex
+        # check. ``measured_tcp_pose_topic`` alone still enables both.
         self.measured_tcp_pose_topic = motion_config.get('measured_tcp_pose_topic')
         self.measured_tcp_pose_frame = motion_config.get('measured_tcp_pose_frame')
-        if self.measured_tcp_pose_topic:
+        self.robot_state_topic = (motion_config.get('robot_state_topic')
+                                  or self.measured_tcp_pose_topic)
+        if self.measured_tcp_pose_topic and self.measured_tcp_pose_topic != self.robot_state_topic:
+            raise ValueError(
+                'motion.robot_state_topic and motion.measured_tcp_pose_topic must name the '
+                f'same FrankaState topic; got {self.robot_state_topic!r} and '
+                f'{self.measured_tcp_pose_topic!r}')
+        if self.robot_state_topic:
             from franka_msgs.msg import FrankaState
             self._subscribers.append(rospy.Subscriber(
-                self.measured_tcp_pose_topic, FrankaState, self._on_franka_state,
+                self.robot_state_topic, FrankaState, self._on_franka_state,
                 queue_size=1, tcp_nodelay=True))
         self.action_type = str(motion_config.get('action_type', 'follow_joint_trajectory'))
         if self.action_type != 'follow_joint_trajectory':
@@ -116,6 +130,11 @@ class ArmDriver:
         self.client = actionlib.SimpleActionClient(motion_config['controller_action'],
                                                    FollowJointTrajectoryAction)
         rospy.loginfo(f'using measured joint states from {self.state_topic}')
+        if self.robot_state_topic:
+            rospy.loginfo(f'watching the robot mode (reflex, user stop) on {self.robot_state_topic}')
+        else:
+            rospy.logwarn('motion.robot_state_topic is not set: a reflex or user stop during a '
+                          'move will not be detected')
         if self.measured_tcp_pose_topic:
             rospy.loginfo(f'using measured TCP poses from {self.measured_tcp_pose_topic}')
 
@@ -163,6 +182,8 @@ class ArmDriver:
         with self._lock:
             self._robot_mode = int(msg.robot_mode)
             self._motion_errors = errors
+        if not self.measured_tcp_pose_topic:
+            return      # mode only: O_T_EE is not the hand TCP, do not use it
         pose = column_major_transform(msg.O_T_EE)
         if pose.shape != (4, 4) or not np.isfinite(pose).all():
             return
@@ -185,7 +206,7 @@ class ArmDriver:
     def robot_mode_problem(self):
         """Why franka_control cannot move the arm right now, or None.
 
-        Known only once a FrankaState has arrived (``measured_tcp_pose_topic``).
+        Known only once a FrankaState has arrived (``robot_state_topic``).
         """
         with self._lock:
             mode = self._robot_mode
