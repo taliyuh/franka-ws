@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from board_pipeline import diagnose, eye_in_hand, grasp, panda, ros, stationary
+from board_pipeline import campaign, diagnose, extract, eye_in_hand, grasp, insert, panda, ros, stationary
 from board_pipeline.config import SETUPS, Config, PipelineError, load_yaml
 from board_pipeline.session import (BOARD_POSE, CALIBRATION, REUSED, Context, Session,
                                     run_stage, step_status)
@@ -247,6 +247,30 @@ def cmd_probe(cfg: Config, args) -> None:
         print(f"\nlooks right? `pipeline probe --hole {args.hole}` moves the arm")
 
 
+def cmd_insert(cfg: Config, args) -> None:
+    insert.run(Session.open(cfg, args.session), args, _probe_target)
+
+
+def cmd_extract(cfg: Config, args) -> None:
+    extract.cmd_extract(Session.open(cfg, args.session), args, _probe_target)
+
+
+def cmd_campaign(cfg: Config, args) -> None:
+    session = Session.open(cfg, args.session)
+    if args.action == "start":
+        campaign.cmd_start(session, args)
+    elif args.action == "run":
+        campaign.cmd_run(session, args, _probe_target)
+    elif args.action == "peg":
+        campaign.cmd_peg(session, args)
+    else:
+        campaign.cmd_status(session, args)
+
+
+def cmd_found(cfg: Config, args) -> None:
+    insert.cmd_found(Session.open(cfg, args.session), args)
+
+
 def cmd_grasp(cfg: Config, args) -> None:
     # The session's config snapshot if there is one, else the template: the
     # grasp width only needs grasps.yaml, not a board pose.
@@ -462,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pipeline",
         description="Camera calibration, board localisation and hole probing for the Franka Panda.",
         epilog="Run on the host. Typical run: new -> calibrate -> locate -> grasp -> check -> probe "
-               "-> release (robot and cameras launched by hand in the container)")
+               "-> release, or grasp -> insert (robot and cameras launched by hand in the container)")
     parser.add_argument("--session", help="session to use instead of the current one")
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -523,6 +547,97 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--watch", action="store_true",
                            help="keep printing twice a second until Ctrl-C (also while hand-guiding)")
         p.set_defaults(func=cmd_probe)
+
+    p = sub.add_parser(
+        "insert", help="put the held peg into a hole: probe approach, up to 5 tilt searches, release, lift",
+        description="The probe's approach to a few mm above the hole (ROS), then up to --attempts runs of the tilt "
+                    "search (rl_manip robot_session peg_search tilt-slide, libfranka, the ROS controller stopped), "
+                    "each aimed at the best belief so far (an earlier hold or dip); inserted: open the hand and "
+                    "lift; not inserted: lift with the peg. Settings: the config's insert section. DETAILS.md.")
+    p.add_argument("--hole", required=True, help="e.g. hexagon_c1mm; `pipeline holes` lists them")
+    p.add_argument("--height", type=float, default=None, metavar="MM",
+                   help="tip height above the vision board where the probe stops (default insert.start_height_mm)")
+    p.add_argument("--attempts", type=int, default=None, help="tilt-search runs at most (default insert.attempts)")
+    p.add_argument("--pattern", choices=("lines", "spiral"), default=None,
+                   help="search pattern (default insert.pattern; lines is the robot-tested one)")
+    p.add_argument("--slide-dir", type=float, default=None, metavar="DEG",
+                   help="preferred slide direction in the base frame (default insert.slide_dir_base_deg)")
+    p.add_argument("--tip-from", metavar="FILE", help="the peg tip: a pivot_calibration file, or cad (default: the session's tips/<shape>.yaml if any, else CAD)")
+    p.add_argument("--turn", type=float, default=0.0, metavar="DEG",
+                   help="turn the hand further about the peg axis (a multiple of the peg's symmetry), as probe")
+    p.add_argument("--no-joint-correction", action="store_true",
+                   help="aim at the board pose as calibrated, without the per-hole joint-offset shift")
+    p.add_argument("--here", action="store_true",
+                   help="skip the probe's approach: the tip is already within the approach above the board")
+    p.add_argument("--method", choices=["plunge", "peck", "tilt"],
+                   help="plunge (default, insert.method): one position-controlled plunge, the board touched beside "
+                        "the hole, then the tilt search; peck: a grid of plunges; tilt: the tilt search only")
+    p.add_argument("--touches", choices=["auto", "0", "1", "3"], default=None,
+                   help="board touches after a plunge that did not insert (insert.board_touches): 3 the local plane; "
+                        "1 this grasp's height on the board height model's slope; 0 the model only; auto 1 once the "
+                        "model knows the board's slope, else 3")
+    p.add_argument("--no-board-correction", action="store_true",
+                   help="aim at the hole as vision has it, without the correction fitted to the holes found so far "
+                        "(<session>/insert/found_holes.yaml)")
+    p.add_argument("--no-centre", action="store_true",
+                   help="inserted: do not touch the hole walls before the release (the seated tip is recorded)")
+    p.add_argument("--search", choices=["grid", "belief"], default=None,
+                   help="how later attempts are aimed: grid (default, insert.search): a probability grid of the hole "
+                        "from every attempt's log, lines planned on it; belief: the last hold or dip")
+    p.add_argument("--dry-run", action="store_true",
+                   help="validate the probe target and peg_search's options; no motion, no robot connection")
+    p.set_defaults(func=cmd_insert)
+
+    p = sub.add_parser(
+        "extract", help="pull a peg out of a hole with the empty hand: roof onto the peg top, grasp, compliant pull",
+        description="Where the peg is: the campaign's release record of the hole (--from-run: an insert run's), else "
+                    "the vision hole. The probe's approach over it (ROS), then peg_search extract (libfranka, "
+                    "robot.launch stopped): a Cartesian impedance stiff in z and soft in x, y, tilt and yaw descends "
+                    "until the fingers' roof touches the peg top, grasps (the fingers move the soft hand onto the "
+                    "peg), pulls it straight out and lifts. Settings: the config's extract section.")
+    p.add_argument("--hole", required=True, help="the hole the peg is in")
+    p.add_argument("--from-run", metavar="RUN",
+                   help="the insert run (sessions/<name>/insert/RUN) that released the peg there: its hand pose")
+    p.add_argument("--vision", action="store_true", help="aim at the vision hole even if the campaign has a record")
+    p.add_argument("--here", action="store_true",
+                   help="the arm is still over the released peg (right after its insert): no ROS approach")
+    p.add_argument("--no-joint-correction", action="store_true",
+                   help="aim at the board pose as calibrated, without the per-hole joint-offset shift")
+    p.add_argument("--dry-run", action="store_true", help="validate the target and peg_search's options; no motion")
+    p.set_defaults(func=cmd_extract)
+
+    p = sub.add_parser(
+        "campaign", help="full-board insertions, unattended: every peg through its holes, extract in between",
+        description="start: every peg in its campaign.start_clearance hole, the hand empty. run: each round takes "
+                    "every shape through campaign.clearances (extract, insert, ...); a peg that does not go in is "
+                    "parked in its campaign.park_clearance hole. Resumable: state.yaml says where every peg is. "
+                    "status: where it is and the results so far. peg: tell it where a peg is after you moved it.")
+    csub = p.add_subparsers(dest="action", required=True, metavar="ACTION")
+    c = csub.add_parser("start", help="a new campaign (the pegs in their start holes)")
+    c.add_argument("--rounds", type=int, default=None, help="full-board rounds (default campaign.rounds)")
+    c.add_argument("--shapes", nargs="+", default=None, help="pegs in order (default campaign.shapes)")
+    c.add_argument("--fresh", action="store_true", help="replace an existing campaign")
+    c = csub.add_parser("run", help="run (or go on with) the campaign")
+    c.add_argument("--max-inserts", type=int, default=None, metavar="N", help="stop after N inserts")
+    c.add_argument("--no-board-correction", action="store_true",
+                   help="every insert aims at the vision hole (insert --no-board-correction)")
+    c.add_argument("--dry-run", action="store_true", help="list the inserts left; no motion")
+    csub.add_parser("status", help="where the pegs are, and the results so far")
+    c = csub.add_parser("peg", help="tell the campaign where a peg is (after moving it by hand, or a stop)")
+    c.add_argument("shape")
+    c.add_argument("--at", required=True, metavar="HOLE", help="its hole, or hand, or unknown")
+    c.add_argument("--from-run", metavar="RUN", help="the insert run that released it there (its hand pose)")
+    c.add_argument("--step", nargs=3, metavar=("ROUND", "SHAPE", "CLEARANCE"),
+                   help="also go on from this insert (e.g. 3 hexagon c1mm)")
+    p.set_defaults(func=cmd_campaign)
+
+    p = sub.add_parser("found", help="the holes insert found, and the board correction they give",
+                       description="Lists <session>/insert/found_holes.yaml and the board correction fitted to the "
+                                   "holes of the current board pose (what `pipeline insert` applies).")
+    p.add_argument("--import-runs", action="store_true",
+                   help="add the inserted runs of insert/ not in the record yet (their seated tip; runs after the "
+                        "board pose was last written only)")
+    p.set_defaults(func=cmd_found)
 
     p = sub.add_parser("grasp", help="close the hand on a peg (width from config/grasps.yaml)")
     p.add_argument("shape", nargs="?", metavar="SHAPE",

@@ -138,10 +138,13 @@ def robot_mode(cfg: Config) -> int | None:
 
 
 ARM_JOINT_STATES = "/franka_state_controller/joint_states"
+_SKIP_CURRENT_JOINTS = False
 
 
 def current_joints(cfg: Config) -> list[float] | None:
     """The arm's 7 measured joint angles (panda_joint1..7), None if no state arrives."""
+    if _SKIP_CURRENT_JOINTS:
+        return None
     try:
         echoed = output(cfg, ["rostopic", "echo", "-n1", ARM_JOINT_STATES], timeout=5.0)
         state = yaml.safe_load(echoed.split("\n---")[0]) or {}

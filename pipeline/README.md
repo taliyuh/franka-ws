@@ -38,6 +38,13 @@ After changing code in `src/`, rebuild: `docker exec -it franka_ros bash -ic "cd
 ./pipeline/pipeline release
 ```
 
+Or, instead of `probe` and `release`, put the peg in:
+
+```bash
+./pipeline/pipeline insert --hole hexagon_c1mm --dry-run   # no motion
+./pipeline/pipeline insert --hole hexagon_c1mm             # probe approach, tilt search, release, lift
+```
+
 Keep the e-stop at hand whenever the arm moves.
 
 ## Commands
@@ -52,6 +59,9 @@ Keep the e-stop at hand whenever the arm moves.
 | `check --hole H` | show the target, no motion |
 | `probe --hole H` | move the peg tip onto the hole (Enter stops, Enter retracts) |
 | `tip --hole H` | where the peg tip is now |
+| `insert --hole H` | probe approach to 6 mm above the hole, straight down until contact, else up to 5 tilt searches (rl_manip peg_search), then open the hand and lift 6 cm; no keys. It stops robot.launch for peg_search and starts it again in the background |
+| `extract --hole H` | the empty hand pulls the peg out of H: compliant descent until the fingers' roof touches the peg top, grasp (the soft hand fits the peg), compliant pull |
+| `campaign start / run / status / peg` | unattended full-board rounds: every peg 3 -> 1 -> 0.2 -> 0.03 mm, extracted in between; failed inserts parked in the 3 mm hole |
 | `accuracy` | probe 4 holes, record target vs measured, hold for photos |
 | `repeatability` | how well the arm returns to taught points |
 | `diag` | tests that find where a constant probe error comes from |
