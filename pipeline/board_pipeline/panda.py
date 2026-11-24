@@ -66,14 +66,40 @@ def from_vec(v):
     return t
 
 
-def ik(target, seed, tip="panda_hand_tcp"):
-    """Joint angles reaching `target` (4x4) from `seed`; returns (q, max residual)."""
+def arm_angle(q) -> float | None:
+    """Elbow arm angle psi (rad, 0 = elbow straight up = J3 near 0), matching rl_manip arm_angle.h.
+    Returns None if the shoulder-wrist line is within 18 deg of vertical or elbow within 5 cm of it."""
+    o = frame_origins(q)
+    s, e, w = o[1], o[3], o[5]
+    sw = w - s
+    n_sw = float(np.linalg.norm(sw))
+    if n_sw < 1e-6:
+        return None
+    u = sw / n_sw
+    if abs(u[2]) > 0.95:
+        return None
+    v = np.array([0.0, 0.0, 1.0]) - u[2] * u
+    v /= float(np.linalg.norm(v))
+    el = (e - s) - float(np.dot(e - s, u)) * u
+    if float(np.linalg.norm(el)) < 0.05:
+        return None
+    return math.atan2(float(np.dot(u, np.cross(v, el))), float(np.dot(v, el)))
+
+
+def ik(target, seed, tip="panda_hand_tcp", arm_angle_rad: float | None = None):
+    """Joint angles reaching `target` (4x4) from `seed`; returns (q, max 6D pose residual).
+    With arm_angle_rad (e.g. 0.0), uses the 7th DoF to also hold the elbow arm angle there."""
     def err(q):
         t = fk(q, tip)
-        return np.r_[(t[:3, 3] - target[:3, 3]) * 10,
+        base = np.r_[(t[:3, 3] - target[:3, 3]) * 10,
                      Rotation.from_matrix(target[:3, :3].T @ t[:3, :3]).as_rotvec(),
                      1e-5 * (q - seed)]
-    solution = least_squares(err, seed, bounds=(LOWER, UPPER))
+        if arm_angle_rad is None:
+            return base
+        psi = arm_angle(q)
+        psi_err = 0.0 if psi is None else math.remainder(psi - arm_angle_rad, 2 * math.pi)
+        return np.r_[base, 0.05 * psi_err]
+    solution = least_squares(err, np.clip(seed, LOWER, UPPER), bounds=(LOWER, UPPER))
     return solution.x, float(np.abs(err(solution.x)[:6]).max())
 
 

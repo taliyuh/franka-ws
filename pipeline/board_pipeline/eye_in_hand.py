@@ -833,21 +833,35 @@ def hole_target(session, cfg, hole: dict, name: str, tool, joint_correction: boo
     seeds = ([near] if tool.joints is not None else []) \
         + [np.r_[base[:6], base[6] + turn] for base in (seed, panda.READY)
            for turn in (0.0, -math.pi / 2, math.pi / 2, -math.pi, math.pi)]
-    solutions = [panda.ik(target, np.clip(s, panda.LOWER, panda.UPPER)) for s in seeds]
-    good = [q for q, r in solutions if r < 1e-4]
-    q_true, residual = (min(good, key=lambda q: np.abs(q - near).max()), 0.0) if good \
-        else min(solutions, key=lambda t: t[1])
+    # Prefer arm angle psi = 0 (elbow up, matching grasp.choose_turn and peg_search's posture rule) so the
+    # joint-offset correction and the probe/insert posture always agree; fall back to unconstrained IK if needed.
+    psi_good = []
+    for s in seeds:
+        q, r = panda.ik(target, np.clip(np.r_[s[:2], 0.0, s[3:]], panda.LOWER, panda.UPPER), arm_angle_rad=0.0)
+        psi = panda.arm_angle(q)
+        margin16 = float(np.min(np.minimum(q[:6] - panda.LOWER[:6], panda.UPPER[:6] - q[:6])))
+        if r < 1e-4 and psi is not None and abs(psi) < 0.05 and margin16 >= 0.15:
+            psi_good.append(q)
+    if psi_good:
+        q_true, residual = min(psi_good, key=lambda q: np.abs(q - near).max()), 0.0
+    else:
+        solutions = [panda.ik(target, np.clip(s, panda.LOWER, panda.UPPER)) for s in seeds]
+        good = [q for q, r in solutions if r < 1e-4]
+        q_true, residual = (min(good, key=lambda q: np.abs(q - near).max()), 0.0) if good \
+            else min(solutions, key=lambda t: t[1])
     if residual > 1e-4:
         raise PipelineError(f"no IK solution over {name} (residual {residual:.2e})")
     correction = panda.fk(q_true - cal.dq, "panda_hand_tcp") @ np.linalg.inv(panda.fk(q_true, "panda_hand_tcp"))
     shift = (correction @ np.r_[tip[:3], 1])[:3] - tip[:3]
     rotation = math.degrees(Rotation.from_matrix(correction[:3, :3]).magnitude())
+    psi_cmd = panda.arm_angle(q_true - cal.dq)
+    psi_note = f", psi {math.degrees(psi_cmd):+.2f} deg" if psi_cmd is not None else ""
     if joint_correction:
         print(f"joint-offset correction at {name}: tip shift {np.round(shift * 1e3, 2)} mm, "
-              f"rotation {rotation:.3f} deg")
+              f"rotation {rotation:.3f} deg{psi_note}")
     else:
         print(f"joint-offset correction at {name}: OFF (--no-joint-correction); the calibrated dq "
-              f"would shift the tip {np.round(shift * 1e3, 2)} mm, rotation {rotation:.3f} deg")
+              f"would shift the tip {np.round(shift * 1e3, 2)} mm, rotation {rotation:.3f} deg{psi_note}")
         correction = np.eye(4)
 
     out = session.path / "targets" / f"{name}.json"

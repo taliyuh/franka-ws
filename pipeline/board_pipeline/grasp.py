@@ -150,8 +150,22 @@ def wrist_margin(q7: float) -> float:
     return float(min(q7 - panda.LOWER[6], panda.UPPER[6] - q7))
 
 
-def _solve(target: np.ndarray, seeds: list[np.ndarray], near: np.ndarray) -> np.ndarray | None:
-    """IK from each seed in turn; the converged solution nearest `near`, None if none."""
+def _solve(target: np.ndarray, seeds: list[np.ndarray], near: np.ndarray,
+           arm_angle_rad: float | None = 0.0) -> np.ndarray | None:
+    """IK from each seed in turn; prefers solutions at `arm_angle_rad` (default 0: elbow up, matching peg_search's
+    posture rule) with >= 0.15 rad joint margin on J1-6, falling back to unconstrained IK if none exist."""
+    if arm_angle_rad is not None:
+        psi_seeds = [np.r_[s[:2], 0.0, s[3:]] for s in seeds]
+        good_psi = []
+        for seed in psi_seeds:
+            q, residual = panda.ik(target, np.clip(seed, panda.LOWER, panda.UPPER), arm_angle_rad=arm_angle_rad)
+            psi = panda.arm_angle(q)
+            margin16 = float(np.min(np.minimum(q[:6] - panda.LOWER[:6], panda.UPPER[:6] - q[:6])))
+            if residual < 1e-4 and psi is not None and abs(math.remainder(psi - arm_angle_rad, 2 * math.pi)) < 0.05 \
+                    and margin16 >= 0.15:
+                good_psi.append(q)
+        if good_psi:
+            return min(good_psi, key=lambda q: float(np.abs(q - near).max()))
     good = [q for q, residual in (panda.ik(target, np.clip(seed, panda.LOWER, panda.UPPER))
                                   for seed in seeds) if residual < 1e-4]
     return min(good, key=lambda q: float(np.abs(q - near).max())) if good else None
