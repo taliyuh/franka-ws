@@ -652,8 +652,19 @@ def make_steps(stage: str) -> list[Step]:
         x_seed = np.asarray(json.loads(prior.read_text())["matrix"])
         n, fit_chain, error, unpack = chain_model(terms, dq_fixed)
         base0 = panda.fk(views[0]["q"], "panda_link6") @ x_seed @ views[0]["cam_board"]
-        print(f"  fitting {'+'.join(terms) or 'X only'} on {len(views)} views, then leave-one-out")
+        print(f"  fitting {'+'.join(terms) or 'X only'} on {len(views)} views, then pruning outliers and leave-one-out")
         v = fit_chain(views, np.r_[panda.to_vec(x_seed), panda.to_vec(base0), np.zeros(n - 12)])
+        dropped_views: dict[str, float] = {}
+        while len(views) > 10:
+            fit_err = np.array([error(w, v) for w in views])
+            limit = max(4.0, 3.0 * float(np.median(fit_err)))
+            worst = int(np.argmax(fit_err))
+            if fit_err[worst] <= limit:
+                break
+            bad = views.pop(worst)
+            dropped_views[bad["name"]] = round(float(fit_err[worst]), 4)
+            print(f"  {bad['name']}: {fit_err[worst]:.2f} mm corner residual (> {limit:.2f} mm), dropped")
+            v = fit_chain(views, v)
         loo = np.array([error(views[i], fit_chain(views[:i] + views[i + 1:], v)) for i in range(len(views))])
         fit_err = np.array([error(w, v) for w in views])
         x, base_board, dq, s, c = unpack(v)
@@ -670,7 +681,8 @@ def make_steps(stage: str) -> list[Step]:
             "intrinsics": dict(zip(intr["names"], intr["refined"])),
             "rim_bias": intr["rim_bias"],
             "T_base_board_during_calibration": base_board.tolist(),
-            "quality": {"views": len(views), "fit_median_mm": float(np.median(fit_err)),
+            "quality": {"views": len(views), "views_dropped": dropped_views,
+                        "fit_median_mm": float(np.median(fit_err)),
                         "loo_median_mm": float(np.median(loo)),
                         "loo_p90_mm": float(np.percentile(loo, 90)),
                         "loo_max_mm": float(loo.max()),
