@@ -108,11 +108,14 @@ ARG PANDA_MOVEIT_CONFIG_VERSION=0.8.1
 ARG AZURE_DRIVER_COMMIT=62c740603bedbdaf373dc81ec521f791bc0bad0d
 ARG ORBBEC_ROS1_VERSION=v2.10.6
 WORKDIR /opt/franka_underlay
+# Adds color_exposure_us (manual colour exposure) to the ROS 1 Azure driver.
+COPY azure_color_exposure.patch /tmp/azure_color_exposure.patch
 RUN mkdir -p src \
     && git clone --depth 1 -b ${FRANKA_ROS_VERSION} https://github.com/frankaemika/franka_ros.git src/franka_ros \
     && git clone --depth 1 -b ${PANDA_MOVEIT_CONFIG_VERSION} https://github.com/moveit/panda_moveit_config.git src/panda_moveit_config \
     && git clone -b melodic https://github.com/microsoft/Azure_Kinect_ROS_Driver.git src/Azure_Kinect_ROS_Driver \
     && git -C src/Azure_Kinect_ROS_Driver checkout ${AZURE_DRIVER_COMMIT} \
+    && patch -d src/Azure_Kinect_ROS_Driver -p1 < /tmp/azure_color_exposure.patch \
     && git clone --depth 1 -b ${ORBBEC_ROS1_VERSION} https://github.com/orbbec/OrbbecSDK_ROS1.git src/OrbbecSDK_ROS1 \
     && rm -rf src/*/.git
 # rosdep fills in whatever the list above missed. libfranka is skipped: the

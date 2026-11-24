@@ -2,7 +2,7 @@
 <!--
   Azure Kinect on the wrist, 4K lossless colour for the eye-in-hand pipeline.
 
-    roslaunch panda_calibration azure_4k.launch
+    roslaunch panda_calibration azure_4k.launch [fps:=5] [color_exposure_us:=8330]
 
   Topics under /azure_camera: rgb/image_raw (bgra8 3840x2160),
   rgb/camera_info, depth_to_rgb/image_raw (16UC1 mm, registered to colour).
@@ -13,6 +13,8 @@
   <arg name="sensor_sn" default="" />
   <arg name="fps" default="15" doc="2160P allows 5, 15 or 30 (30 only with NFOV)" />
   <arg name="depth_mode" default="NFOV_UNBINNED" />
+  <arg name="color_exposure_us" default="0"
+       doc="manual colour exposure in microseconds (SDK rounds to a supported step); 0 = auto" />
 
   <group ns="$(arg namespace)">
     <include file="$(find azure_kinect_ros_driver)/launch/driver.launch">
@@ -26,6 +28,7 @@
       <!-- A 4K point cloud costs a CPU core and nothing here reads it. -->
       <arg name="point_cloud" value="false" />
       <arg name="rgb_point_cloud" value="false" />
+      <arg name="color_exposure_us" value="$(arg color_exposure_us)" />
       <arg name="sensor_sn" value="$(arg sensor_sn)" />
       <arg name="required" value="true" />
     </include>
