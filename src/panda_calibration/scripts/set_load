@@ -15,11 +15,23 @@ Parameters (private): ~mass, ~center_of_mass [x, y, z] (flange frame),
 ~inertia (9), ~reset_ee (default true), ~delay (s, default 5).
 """
 import rospy
-from controller_manager_msgs.srv import SwitchController, SwitchControllerRequest
+from controller_manager_msgs.srv import ListControllers, SwitchController, SwitchControllerRequest
 from franka_msgs.srv import SetEEFrame, SetLoad
 
 CONTROLLER = 'position_joint_trajectory_controller'
 IDENTITY = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+
+def wait_for_controller_running(list_controllers, controller, timeout_s=30.0, poll_s=0.2):
+    deadline = rospy.Time.now() + rospy.Duration.from_sec(timeout_s)
+    while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+        try:
+            if any(c.name == controller and c.state == 'running' for c in list_controllers().controller):
+                return True
+        except rospy.ServiceException:
+            pass
+        rospy.sleep(poll_s)
+    return False
 
 
 def main():
@@ -28,14 +40,18 @@ def main():
     com = rospy.get_param('~center_of_mass')
     inertia = rospy.get_param('~inertia')
     reset_ee = rospy.get_param('~reset_ee', True)
-    for name in ('/controller_manager/switch_controller', '/franka_control/set_load',
-                 '/franka_control/set_EE_frame'):
+    for name in ('/controller_manager/list_controllers', '/controller_manager/switch_controller',
+                 '/franka_control/set_load', '/franka_control/set_EE_frame'):
         rospy.wait_for_service(name)
+    list_controllers = rospy.ServiceProxy('/controller_manager/list_controllers', ListControllers)
     switch = rospy.ServiceProxy('/controller_manager/switch_controller', SwitchController)
     set_load = rospy.ServiceProxy('/franka_control/set_load', SetLoad)
     set_ee = rospy.ServiceProxy('/franka_control/set_EE_frame', SetEEFrame)
-    # Let the spawner load and start the controller before cycling it.
-    rospy.sleep(rospy.get_param('~delay', 5.0))
+    # Wait until the spawner has actually started the controller instead of a fixed 5 s sleep.
+    if not wait_for_controller_running(list_controllers, CONTROLLER,
+                                       timeout_s=float(rospy.get_param('~wait_timeout', 30.0))):
+        rospy.logerr('set_load: %s did not reach running state; payload and end effector not set', CONTROLLER)
+        return
     # Keyword arguments: Noetic's request also has start_asap and timeout, so
     # a positional (start, stop, strictness) call is rejected.
     strict = SwitchControllerRequest.STRICT
