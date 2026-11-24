@@ -186,8 +186,9 @@ def _planned_joints(target, tool):
 
 
 def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None, height_mm: float,
-                  turn_deg: float = 0.0, joint_correction: bool = True):
-    """Write one hole's target and tool files; returns (tool, tip source, target file, probe_board argv)."""
+                  turn_deg: float = 0.0, joint_correction: bool = True, mirror: bool = False):
+    """Write one hole's target and tool files; returns (tool, tip source, target file, probe_board argv).
+    mirror: the peg is the CAD's mirror image (grasp.mirror_seat; extract.mirrored_shapes)."""
     if name not in holes:
         raise PipelineError(f"unknown hole {name!r}; `pipeline holes` lists them")
     hole = holes[name]
@@ -197,14 +198,11 @@ def _probe_target(session: Session, holes: dict, name: str, tip_from: str | None
     # robot state, joint 7 is kept near mid-range.
     start = ros.current_joints(session.cfg)
     tool, candidates = grasp.choose_turn(session.cfg, hole, name, board,
-                                         None if start is None else np.asarray(start))
+                                         None if start is None else np.asarray(start), mirror=mirror)
     _print_turns(tool, candidates, start)
     if turn_deg:
         tool = grasp.turn_further(session.cfg, hole, name, tool, board, turn_deg)
-    tip_source = "CAD"
-    if tip_from:
-        tool, tip_source = grasp.apply_pivot_tip(
-            tool, grasp.load_pivot_tip(ros.host_path(session.cfg, tip_from)))
+    tool, tip_source = grasp.resolve_tip(tool, tip_from, session.path, lambda p: ros.host_path(session.cfg, p))
     print(f"held peg: {tool.shape} in the V-block fingers (grasp width {tool.grasp_width_mm:.2f} mm), "
           f"peg yaw {math.degrees(tool.peg_yaw):.2f} deg on the board, "
           f"tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP ({tip_source})")
@@ -281,8 +279,10 @@ def cmd_release(cfg: Config, args) -> None:
 
 
 def cmd_repeatability(cfg: Config, args) -> None:
+    session_path = None
     if args.session or Session.current_link(cfg).is_symlink():
-        cfg = Session.open(cfg, args.session).cfg
+        opened = Session.open(cfg, args.session)
+        cfg, session_path = opened.cfg, opened.path
     if args.resume:
         runs = sorted(path.parent for path in (cfg.workspace / "repeatability").glob("*/run.yaml"))
         out = ros.host_path(cfg, args.resume) if args.resume != "latest" else (runs[-1] if runs else None)
@@ -297,9 +297,7 @@ def cmd_repeatability(cfg: Config, args) -> None:
             raise PipelineError(f"no hole for peg shape {args.shape!r} in {cfg['holes']}")
         # Any hole of the shape will do: the tip offset and the grasp width depend on the peg only.
         tool = grasp.hole_tool(cfg, holes[name], name)
-        tip_source = "CAD"
-        if args.tip_from:
-            tool, tip_source = grasp.apply_pivot_tip(tool, grasp.load_pivot_tip(ros.host_path(cfg, args.tip_from)))
+        tool, tip_source = grasp.resolve_tip(tool, args.tip_from, session_path, lambda p: ros.host_path(cfg, p))
         print(f"held peg: {tool.shape}, tip {np.round(tool.tip_offset * 1e3, 2)} mm from the TCP ({tip_source})")
         out = cfg.workspace / "repeatability" / datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         # Fixed-point: argparse takes "-2e-18" for an option, not for a negative number.
@@ -512,7 +510,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="peg tip height above the board surface, mm (default 0)")
         p.add_argument("--tip-from", metavar="FILE",
                        help="use the peg tip measured by `rosrun panda_calibration pivot_calibration` "
-                            "(only for the peg shape it was measured on) instead of the CAD tip")
+                            "(only for the peg shape it was measured on) instead of the CAD tip; cad: the CAD tip "
+                            "(default: the session's tips/<shape>.yaml if any, else CAD)")
         p.add_argument("--turn", type=float, default=0.0, metavar="DEG",
                        help="turn the hand this much further about the peg axis than the automatic choice "
                             "(a multiple of the peg's symmetry; any angle for the round peg). "
@@ -545,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="teach points by hand, return to them from home, plot joint and tip errors "
                             "(no compensation)")
     p.add_argument("--shape", default="round", help="held peg (default round)")
-    p.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    p.add_argument("--tip-from", metavar="FILE", help="the peg tip: a pivot_calibration file, or cad (default: the session's tips/<shape>.yaml if any, else CAD)")
     p.add_argument("--distances", nargs="+", type=float, default=[25.0, 50.0, 75.0], metavar="CM",
                    help="about how far from the base each point is, one per point (default 25 50 75)")
     p.add_argument("--repeats", type=int, default=3, help="repeats per point (default 3)")
@@ -567,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--height", type=float, default=0.0, metavar="MM",
                    help="where the descent ends: tip height above the board surface, mm "
                         "(default 0: the tip at the surface, in the mouth of the hole)")
-    p.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    p.add_argument("--tip-from", metavar="FILE", help="the peg tip: a pivot_calibration file, or cad (default: the session's tips/<shape>.yaml if any, else CAD)")
     p.add_argument("--no-joint-correction", action="store_true",
                    help="drive to the board pose as calibrated, without the per-hole joint-offset shift "
                         "(eye_in_hand; compare with the corrected landing)")
@@ -606,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     touch.add_argument("--holes", nargs="+", metavar="HOLE",
                        help=f"holes to touch (tests 3-5 default {diagnose.DEFAULT_TOUCH_HOLE}; test 6 default "
                             f"{' '.join(diagnose.DEFAULT_TOUCH_OFF)})")
-    touch.add_argument("--tip-from", metavar="FILE", help="use a pivot_calibration tip instead of the CAD tip")
+    touch.add_argument("--tip-from", metavar="FILE", help="the peg tip: a pivot_calibration file, or cad (default: the session's tips/<shape>.yaml if any, else CAD)")
     touch.add_argument("--new", action="store_true",
                        help="tests 4 and 5: start a new series instead of adding a board placement to the last one")
     p.set_defaults(func=cmd_diag)

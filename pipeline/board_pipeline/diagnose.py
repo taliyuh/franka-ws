@@ -530,9 +530,7 @@ def _target(session: Session, holes: dict, name: str, tip_from: str | None):
     start = ros.current_joints(session.cfg)
     tool, _ = grasp.choose_turn(session.cfg, holes[name], name, board,
                                 None if start is None else np.asarray(start))
-    source = "CAD"
-    if tip_from:
-        tool, source = grasp.apply_pivot_tip(tool, grasp.load_pivot_tip(ros.host_path(session.cfg, tip_from)))
+    tool, source = grasp.resolve_tip(tool, tip_from, session.path, lambda p: ros.host_path(session.cfg, p))
     nominal_file = eye_in_hand.hole_target(session, session.cfg, holes[name], name, tool)
     nominal = np.asarray(json.loads(nominal_file.read_text())["T_base_board"])
     return tool, source, (board @ np.r_[tool.point, SURFACE_Z, 1.0])[:3], nominal

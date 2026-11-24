@@ -19,7 +19,10 @@ tip vector in TCP axes; `write_manipulation_config` writes both for one hole.
 
 The tip comes from the CAD grasp unless `pipeline check/probe --tip-from FILE`
 passes a pivot_calibration result measured on the same peg shape;
-`apply_pivot_tip` swaps it in after comparing it with the CAD tip.
+`apply_pivot_tip` swaps it in after comparing it with the CAD tip. Without
+--tip-from, a measured tip kept in the session for the shape
+(<session>/tips/<shape>.yaml, same format) is used; `--tip-from cad` forces
+the CAD tip (`resolve_tip`).
 """
 
 from __future__ import annotations
@@ -86,8 +89,17 @@ def grasp_width_mm(cfg, shape: str) -> float:
     return float(shapes[shape]["grasp_width_mm"])
 
 
+def mirror_seat(tcp: dict, centre: dict) -> tuple[dict, dict]:
+    """The seat of the mirror image of the CAD peg (2026-11-23: the real rectangle and L pegs are the CAD's mirror
+    images). Mirrored through the peg frame's xz plane (y -> -y; the frame's x, the longest flat's normal, and the
+    centroid stay) with the fingers mirrored through the hand's yz plane (they are symmetric about it): T_peg_tcp' =
+    M_peg T_peg_tcp M_hand, i.e. x kept, y negated, yaw -> 180 deg - yaw; the L's centred origin y negated too."""
+    return ({**tcp, "y_m": -float(tcp["y_m"]), "yaw_deg": 180.0 - float(tcp["yaw_deg"])},
+            {**centre, "y_m": -float(centre["y_m"])})
+
+
 def hole_tool(cfg, hole: dict, name: str, turn: float | None = None,
-              extra_turn_deg: float = 0.0) -> Tool:
+              extra_turn_deg: float = 0.0, mirror: bool = False) -> Tool:
     """The held peg on this hole, turned by `turn` (rad, a multiple of its period).
 
     Without `turn` the peg is turned the multiple of its period that brings the
@@ -104,7 +116,9 @@ def hole_tool(cfg, hole: dict, name: str, turn: float | None = None,
         raise PipelineError(f"{source} has no grasp for {name} ({hole['shape']}); "
                             "regenerate it with pipeline/tools/extract_grasps.py") from error
     tcp = shape["tcp"]
-    r_peg_tcp = _rz(math.radians(tcp["yaw_deg"]+180.0)) @ FLIP
+    if mirror:
+        tcp, centre = mirror_seat(tcp, centre)
+    r_peg_tcp = _rz(math.radians(tcp["yaw_deg"])) @ FLIP
     t_peg_tcp = np.array([tcp["x_m"], tcp["y_m"], tcp["z_m"]])
     hole_yaw = math.radians(hole["yaw_deg"])
     period = math.radians(shape["yaw_period_deg"])
@@ -205,7 +219,7 @@ def _predicted_joints(tools: list[Tool], board: np.ndarray, start: np.ndarray) -
 
 
 def choose_turn(cfg, hole: dict, name: str, board: np.ndarray,
-                start: np.ndarray | None = None) -> tuple[Tool, list[tuple[Tool, np.ndarray | None]]]:
+                start: np.ndarray | None = None, mirror: bool = False) -> tuple[Tool, list[tuple[Tool, np.ndarray | None]]]:
     """The symmetric turn of the held peg that turns the wrist least.
 
     `board` is T_base_board, `start` the arm joints the motion starts from
@@ -217,8 +231,8 @@ def choose_turn(cfg, hole: dict, name: str, board: np.ndarray,
     """
     base = start if start is not None else panda.READY
     reference = float(base[6]) if start is not None else 0.0
-    period = hole_tool(cfg, hole, name).period
-    tools = [hole_tool(cfg, hole, name, turn=turn) for turn in symmetric_turns(period)]
+    period = hole_tool(cfg, hole, name, mirror=mirror).period
+    tools = [hole_tool(cfg, hole, name, turn=turn, mirror=mirror) for turn in symmetric_turns(period)]
     candidates = list(zip(tools, _predicted_joints(tools, board, base)))
     solved = [(tool, q) for tool, q in candidates if q is not None]
     if not solved:
@@ -313,3 +327,23 @@ def apply_pivot_tip(tool: Tool, pivot: PivotTip) -> tuple[Tool, str]:
             source += (f"; the measured tip is turned {turn:.0f} deg about the TCP axis from the CAD "
                        "one, so the grasp yaw in grasps.yaml / grasp.py looks off")
     return replace(tool, tip_offset=measured), source
+
+
+def session_tip_path(session_path: Path, shape: str) -> Path:
+    """Where a session keeps the measured tip of a peg shape (used without --tip-from)."""
+    return Path(session_path) / "tips" / f"{shape}.yaml"
+
+
+def resolve_tip(tool: Tool, tip_from: str | None, session_path: Path | None, host_path=None) -> tuple[Tool, str]:
+    """The tool's tip: --tip-from FILE (host_path maps a container path), `--tip-from cad` the CAD tip, else the
+    session's measured tip of this shape (session_tip_path) when there is one, else CAD."""
+    if tip_from and tip_from.lower() == "cad":
+        return tool, "CAD (--tip-from cad)"
+    if tip_from:
+        return apply_pivot_tip(tool, load_pivot_tip(host_path(tip_from) if host_path else Path(tip_from)))
+    if session_path is not None:
+        path = session_tip_path(session_path, tool.shape)
+        if path.exists():
+            tool, source = apply_pivot_tip(tool, load_pivot_tip(path))
+            return tool, f"{source}, the session's tips/{path.name}"
+    return tool, "CAD"
