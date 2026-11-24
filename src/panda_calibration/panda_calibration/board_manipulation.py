@@ -452,6 +452,9 @@ def main(argv=None) -> int:
                              'works with the controller stopped (hand guiding)')
     parser.add_argument('--watch', action='store_true',
                         help='with --where: keep printing twice a second until Ctrl-C')
+    parser.add_argument('--stay', action='store_true',
+                        help='end the descent at the target (or at an Enter) and exit holding there, no retract '
+                             '(`pipeline insert` hands the arm over to the tilt search)')
     parser.add_argument('--record', metavar='FILE',
                         help='write the commanded and measured TCP pose and joints of every move to FILE '
                              '(YAML, see probe_accuracy.py); the arm then also holds at the bottom when '
@@ -462,6 +465,8 @@ def main(argv=None) -> int:
         parser.error('--watch needs --where')
     if args.record and (args.dry_run or args.where):
         parser.error('--record needs a probe that moves (not --dry-run or --where)')
+    if args.stay and (args.record or args.where):
+        parser.error('--stay excludes --record and --where')
 
     try:
         base_frame, board_transform, surface_z = load_board_pose(args.board_pose)
@@ -490,6 +495,9 @@ def main(argv=None) -> int:
             board_transform, surface_z, offset, approach_height, orientation, pen_tip_offset)
         board_point = board_transform @ np.array(
             [offset[0], offset[1], surface_z + offset[2], 1.0], dtype=float)
+        # The board surface under the target: the commands (with the settle correction) must stay above it. Not the
+        # target's height: with --height > 0 a correction 0.27 mm below a 6 mm target was refused (2026-11-21).
+        surface_point = board_transform @ np.array([offset[0], offset[1], surface_z, 1.0], dtype=float)
         board_normal = board_transform[:3, 2]
         board_normal /= np.linalg.norm(board_normal)
     except (OSError, ValueError, KeyError) as error:
@@ -566,7 +574,7 @@ def main(argv=None) -> int:
 
         def validate_pen_clearance(command_pose: np.ndarray) -> None:
             clearance = signed_board_clearance(
-                command_pose, pen_tip_offset, board_point[:3], board_normal)
+                command_pose, pen_tip_offset, surface_point[:3], board_normal)
             if clearance < -1e-8:
                 raise RuntimeError(
                     f'commanded pen tip would be {abs(clearance) * 1000:.2f} mm '
@@ -603,7 +611,7 @@ def main(argv=None) -> int:
         reader = threading.Thread(target=wait_for_enter, args=(stop_event, typed), daemon=True)
         reader.start()
         descended = 0.0
-        while descended < descent_limit and not stop_event.is_set():
+        while descended < descent_limit - 1e-9 and not stop_event.is_set():
             step = min(segment, descent_limit - descended)
             next_pose = staging.copy()
             next_pose[:3, 3] = (
@@ -625,6 +633,10 @@ def main(argv=None) -> int:
 
         recorder = node.recorder
         reached = not stop_event.is_set()
+        if args.stay:
+            rospy.loginfo(f'{"reached the target" if reached else "stopped"} after {descended * 1000:.1f} mm; '
+                          f'holding here (--stay); {pen_tip()}')
+            return 0
         if reached and recorder is None:
             rospy.logerr('maximum descent reached without an operator stop')
             rospy.logwarn('retracting to the configured approach pose')
