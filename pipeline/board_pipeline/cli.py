@@ -8,6 +8,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import yaml
@@ -164,7 +165,8 @@ def _print_turns(tool, candidates, start) -> None:
         "no turn" if len(candidates) == 1 else f"turns every {math.degrees(tool.period):g} deg"
     origin = f"joint 7 now {start[6]:+.2f} rad" if start is not None else \
         "no robot state, keeping joint 7 near mid-range"
-    print(f"{tool.shape} peg: {shape_turns}; {origin}")
+    elbow = f"; elbow arm angle {math.degrees(tool.arm_angle):+.0f} deg (fallback)" if tool.arm_angle else ""
+    print(f"{tool.shape} peg: {shape_turns}; {origin}{elbow}")
     if tool.period == 0:
         candidates = [c for c in candidates if c[0].turn == tool.turn]
     for option, q in candidates:
@@ -253,6 +255,40 @@ def cmd_insert(cfg: Config, args) -> None:
 
 def cmd_extract(cfg: Config, args) -> None:
     extract.cmd_extract(Session.open(cfg, args.session), args, _probe_target)
+
+
+def cmd_fix_grasp(cfg: Config, args) -> None:
+    """Re-seat a held peg cleanly by inserting into its 3 mm hole (no centre touches) and extracting it right back."""
+    session = Session.open(cfg, args.session)
+    holes = _holes(session.cfg)
+    hole = f"{args.shape}_c3mm"
+    if hole not in holes:
+        shapes = sorted({h["shape"] for h in holes.values()})
+        raise PipelineError(f"unknown shape {args.shape!r} (no {hole} in holes.yaml; shapes: {', '.join(shapes)})")
+    ins_args = SimpleNamespace(hole=hole, attempts=None, height=None, tip_from=None, turn=0.0,
+                               no_joint_correction=False, slide_dir=None, pattern=None, search=None, method=None,
+                               touches=None, no_board_correction=False, no_centre=True, here=False,
+                               dry_run=args.dry_run)
+    ext_args = SimpleNamespace(hole=hole, no_joint_correction=False, dry_run=args.dry_run)
+    if args.dry_run:
+        print(f"fix-grasp {args.shape}: insert {hole} (no centre), then extract {hole} in place")
+        insert.run(session, ins_args, _probe_target, restart_launch=False)
+        extract.run(session, ext_args, _probe_target, restart_launch=False)
+        return
+    s = insert.settings(session.cfg)
+    print(f"fix-grasp {args.shape}: inserting into {hole}, then re-extracting for a clean roof-seated grasp", flush=True)
+    try:
+        outcome = insert.run(session, ins_args, _probe_target, restart_launch=False, raise_on_fail=True)
+        record = (outcome.get("summary") or {}).get("release")
+        ext = extract.run(session, ext_args, _probe_target, record=record, here=record is not None,
+                          restart_launch=False)
+        if not ext["ok"]:
+            raise PipelineError(f"fix-grasp {args.shape}: re-extract from {hole} failed ({ext['error']}); "
+                                f"results in {ext['out']}")
+        campaign.note_extracted(session, hole)
+        print(f"\ndone: {args.shape} peg re-seated cleanly via {hole}; results in {ext['out']}")
+    finally:
+        insert.start_launch(session.cfg, s)
 
 
 def cmd_campaign(cfg: Config, args) -> None:
@@ -654,6 +690,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--width", type=float, default=30.0, metavar="MM",
                    help="open the fingers to this width, mm (default 30, wider than every grasp; max 80)")
     p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("fix-grasp",
+                       help="re-seat a held peg cleanly: insert into its 3 mm hole (no centre) and extract it back")
+    p.add_argument("shape", metavar="SHAPE",
+                   help="peg shape: round, hexagon, triangle, rectangle, or l_shape")
+    p.add_argument("--dry-run", action="store_true", help="check the options without connecting or moving")
+    p.set_defaults(func=cmd_fix_grasp)
 
     p = sub.add_parser("repeatability",
                        help="teach points by hand, return to them from home, plot joint and tip errors "

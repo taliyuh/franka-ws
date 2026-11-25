@@ -46,6 +46,14 @@ SURFACE_Z = 0.025          # board top surface, board frame (holes.yaml surface_
 # -2.85 rad the robot stopped with joint_motion_generator_position_limits_violation.
 WRIST_MARGIN_RAD = 0.35
 ROUND_STEP_DEG = 10.0      # the round peg may turn by any angle; candidates this far apart
+# Elbow fallback (choose_turn): when no peg turn keeps joint 7 WRIST_MARGIN_RAD inside its limits with the elbow
+# arm angle at 0 (the L: one turn only), the elbow is turned, smallest first, in these steps up to the maximum.
+# Turning the elbow by psi moves joint 7 by about 1.3 psi at the same hand pose (2026-11-25 sweep over the L holes),
+# but the robot's kinematic error moves the reported tip about 0.1 mm per degree of arm angle
+# (rl_manip robot_session/POSTURE_FINDINGS.md): the smallest turn that works is taken.
+ELBOW_STEP_DEG = 5.0
+ELBOW_MAX_DEG = 45.0
+ELBOW_TOLERANCE_RAD = 0.05  # a solution this close to the asked arm angle is at it (as _solve)
 
 
 def _rz(angle: float) -> np.ndarray:
@@ -64,6 +72,7 @@ class Tool:
     turn: float = 0.0       # turn about the peg axis from the hole frame, rad
     period: float = 2 * math.pi  # symmetry period of the peg, rad (0 = any turn)
     joints: np.ndarray | None = None  # predicted arm joints at the hole (choose_turn)
+    arm_angle: float = 0.0  # elbow arm angle psi at the hole, rad (choose_turn's elbow fallback; 0 otherwise)
 
     def tcp_pose(self, board: np.ndarray, z: float) -> np.ndarray:
         """Base-frame TCP pose with the peg tip at board height z."""
@@ -164,10 +173,19 @@ def wrist_margin(q7: float) -> float:
     return float(min(q7 - panda.LOWER[6], panda.UPPER[6] - q7))
 
 
+def at_arm_angle(q: np.ndarray, arm_angle_rad: float) -> bool:
+    """Whether q has the elbow at arm_angle_rad (an undefined arm angle counts only for 0, as peg_search's)."""
+    psi = panda.arm_angle(q)
+    if psi is None:
+        return abs(arm_angle_rad) < ELBOW_TOLERANCE_RAD
+    return abs(math.remainder(psi - arm_angle_rad, 2 * math.pi)) < ELBOW_TOLERANCE_RAD
+
+
 def _solve(target: np.ndarray, seeds: list[np.ndarray], near: np.ndarray,
-           arm_angle_rad: float | None = 0.0) -> np.ndarray | None:
+           arm_angle_rad: float | None = 0.0, strict: bool = False) -> np.ndarray | None:
     """IK from each seed in turn; prefers solutions at `arm_angle_rad` (default 0: elbow up, matching peg_search's
-    posture rule) with >= 0.15 rad joint margin on J1-6, falling back to unconstrained IK if none exist."""
+    posture rule) with >= 0.15 rad joint margin on J1-6, falling back to unconstrained IK if none exist (strict: no
+    fallback, None)."""
     if arm_angle_rad is not None:
         psi_seeds = [np.r_[s[:2], 0.0, s[3:]] for s in seeds]
         good_psi = []
@@ -180,13 +198,17 @@ def _solve(target: np.ndarray, seeds: list[np.ndarray], near: np.ndarray,
                 good_psi.append(q)
         if good_psi:
             return min(good_psi, key=lambda q: float(np.abs(q - near).max()))
+        if strict:
+            return None
     good = [q for q, residual in (panda.ik(target, np.clip(seed, panda.LOWER, panda.UPPER))
                                   for seed in seeds) if residual < 1e-4]
     return min(good, key=lambda q: float(np.abs(q - near).max())) if good else None
 
 
-def _predicted_joints(tools: list[Tool], board: np.ndarray, start: np.ndarray) -> list:
+def _predicted_joints(tools: list[Tool], board: np.ndarray, start: np.ndarray,
+                      arm_angle_rad: float = 0.0, strict: bool = False) -> list:
     """Arm joints at the hole for each turn, nearest `start`; probe_board's IK is seeded with them.
+    arm_angle_rad, strict: the elbow wanted and whether a solution elsewhere is refused (_solve).
 
     Joint 7 turns about the TCP z axis, so turning the peg by `turn` about the
     board normal moves joint 7 by about turn * (TCP z . board z) and leaves the
@@ -200,22 +222,29 @@ def _predicted_joints(tools: list[Tool], board: np.ndarray, start: np.ndarray) -
               for offset in (0.0, -math.pi / 2, math.pi / 2, -math.pi, math.pi)]
     order = sorted(range(len(tools)), key=lambda i: abs(tools[i].turn))
     first = tools[order[0]]
-    anchor = _solve(first.tcp_pose(board, SURFACE_Z), spread, start)
+    elbow = {"arm_angle_rad": arm_angle_rad, "strict": strict}
+    anchor = _solve(first.tcp_pose(board, SURFACE_Z), spread, start, **elbow)
     joints: list = [None] * len(tools)
     joints[order[0]] = anchor
     for i in order[1:]:
         tool = tools[i]
         target = tool.tcp_pose(board, SURFACE_Z)
         if anchor is None:
-            joints[i] = _solve(target, spread, start)
+            joints[i] = _solve(target, spread, start, **elbow)
             continue
         seed = anchor.copy()
         seed[6] += (tool.turn - first.turn) * tool.rotation[2, 2]
         if not panda.LOWER[6] <= seed[6] <= panda.UPPER[6]:
             continue
-        q = _solve(target, [seed], seed)
-        joints[i] = q if q is not None else _solve(target, spread, seed)
+        q = _solve(target, [seed], seed, **elbow)
+        joints[i] = q if q is not None else _solve(target, spread, seed, **elbow)
     return joints
+
+
+def elbow_steps(step_deg: float = ELBOW_STEP_DEG, max_deg: float = ELBOW_MAX_DEG) -> list[float]:
+    """The elbow fallback's arm angles, rad, smallest first, each size both ways: 5, -5, 10, -10, ... deg."""
+    count = int(math.floor(max_deg / step_deg + 1e-9))
+    return [math.radians(sign * k * step_deg) for k in range(1, count + 1) for sign in (1, -1)]
 
 
 def choose_turn(cfg, hole: dict, name: str, board: np.ndarray,
@@ -228,6 +257,13 @@ def choose_turn(cfg, hole: dict, name: str, board: np.ndarray,
     joint 7 at least WRIST_MARGIN_RAD inside its limits, the one with the
     smallest joint 7 travel from `start` wins. Returns the chosen tool and
     every candidate with its predicted joints (None: no IK solution).
+
+    All of that is with the elbow arm angle at 0. Only when no turn is safe
+    there (the L, which has one turn, on some board yaws) is the elbow turned:
+    the arm angles of `elbow_steps`, smallest first, until one makes a turn
+    safe; the tool then carries that arm_angle (peg_search holds it, the
+    joint-offset correction is evaluated there) and the candidates are that
+    arm angle's. When none does, the elbow stays at 0 with the warning.
     """
     base = start if start is not None else panda.READY
     reference = float(base[6]) if start is not None else 0.0
@@ -237,14 +273,27 @@ def choose_turn(cfg, hole: dict, name: str, board: np.ndarray,
     solved = [(tool, q) for tool, q in candidates if q is not None]
     if not solved:
         raise PipelineError(f"no IK solution over {name} for any turn of the {hole['shape']} peg")
-    safe = [(tool, q) for tool, q in solved if wrist_margin(q[6]) >= WRIST_MARGIN_RAD]
+    safe = [(tool, q) for tool, q in solved if wrist_margin(q[6]) >= WRIST_MARGIN_RAD and at_arm_angle(q, 0.0)]
     if safe:
         tool, q = min(safe, key=lambda c: abs(c[1][6] - reference))
-    else:
-        tool, q = max(solved, key=lambda c: wrist_margin(c[1][6]))
-        print(f"warning: no turn of the {hole['shape']} peg keeps joint 7 "
-              f"{WRIST_MARGIN_RAD:.2f} rad inside its limits at {name}; the best leaves "
-              f"{wrist_margin(q[6]):.2f} rad. Turn the board towards the robot's mid-range wrist.")
+        return replace(tool, joints=q), candidates
+    best0 = max(solved, key=lambda c: wrist_margin(c[1][6]))
+    for psi in elbow_steps():
+        bent = [replace(t, arm_angle=psi) for t in tools]
+        found = list(zip(bent, _predicted_joints(bent, board, base, arm_angle_rad=psi, strict=True)))
+        safe = [(t, q) for t, q in found if q is not None and wrist_margin(q[6]) >= WRIST_MARGIN_RAD]
+        if safe:
+            tool, q = min(safe, key=lambda c: abs(c[1][6] - reference))
+            print(f"elbow fallback at {name}: with the elbow at 0 no turn of the {hole['shape']} peg keeps joint 7 "
+                  f"{WRIST_MARGIN_RAD:.2f} rad inside its limits (the best leaves {wrist_margin(best0[1][6]):.2f} "
+                  f"rad); arm angle {math.degrees(psi):+.0f} deg leaves {wrist_margin(q[6]):.2f} rad. The reported "
+                  f"tip there is off by about 0.1 mm per degree of arm angle (POSTURE_FINDINGS.md)")
+            return replace(tool, joints=q), found
+    tool, q = best0
+    print(f"warning: no turn of the {hole['shape']} peg keeps joint 7 "
+          f"{WRIST_MARGIN_RAD:.2f} rad inside its limits at {name}, with the elbow at 0 or turned up to "
+          f"+-{ELBOW_MAX_DEG:g} deg; the best leaves {wrist_margin(q[6]):.2f} rad. Turn the board towards the "
+          "robot's mid-range wrist.")
     return replace(tool, joints=q), candidates
 
 
@@ -254,12 +303,13 @@ def turn_further(cfg, hole: dict, name: str, tool: Tool, board: np.ndarray, extr
     Its joints are predicted from the chosen ones with joint 7 pre-turned; a turn
     that leaves joint 7 near its limit is only warned about: it was asked for.
     """
-    turned = hole_tool(cfg, hole, name, turn=tool.turn, extra_turn_deg=extra_turn_deg)
+    turned = replace(hole_tool(cfg, hole, name, turn=tool.turn, extra_turn_deg=extra_turn_deg),
+                     arm_angle=tool.arm_angle)
     joints = None
     if tool.joints is not None:
         seed = tool.joints.copy()
         seed[6] += math.remainder(turned.turn - tool.turn, 2 * math.pi) * turned.rotation[2, 2]
-        joints = _solve(turned.tcp_pose(board, SURFACE_Z), [seed], seed)
+        joints = _solve(turned.tcp_pose(board, SURFACE_Z), [seed], seed, arm_angle_rad=tool.arm_angle)
     if joints is None:
         print(f"warning: --turn {extra_turn_deg:g}: no IK solution near the chosen wrist; "
               "joint 7 may have to swing a long way")

@@ -495,6 +495,19 @@ def fast_probe_argv(cfg: Config, s: dict, argv: list, out: Path, clearance_m: fl
 
 
 # ---------------------------------------------------------------- the command
+def arm_angle_deg(tool) -> float:
+    """The elbow arm angle the hole was planned at (grasp.choose_turn's elbow fallback), deg; 0 normally."""
+    return math.degrees(float(getattr(tool, "arm_angle", 0.0) or 0.0))
+
+
+def posture_args(tool) -> list:
+    """peg_search's posture target for the modes that hold the elbow (tilt-slide): nothing at the default arm angle
+    0; the planned one when grasp.choose_turn had to turn the elbow (else the posture move would turn it back to 0 and
+    joint 7 onto its limit)."""
+    psi = arm_angle_deg(tool)
+    return [] if abs(psi) < 1e-6 else ["--arm-angle-deg", f"{psi:.3f}"]
+
+
 def peg_geometry_args(tool) -> list:
     """The held peg's tip for peg_search (hand frame from the flange): TCP + the pipeline's tip offset."""
     tip = np.asarray(tool.tip_offset, float)
@@ -814,7 +827,8 @@ def _centre_and_record(cfg, s, out, session, args, tool, entry, holes, table_nam
             return None
         found = holefit.found_from_seat(seat, free, f"seated tip ({seat_key})")
         found["sigma_m"] += extra
-    entry_ = holefit.record_found(session.path, args.hole, vision_base[:2], found, board_sha, out.name)
+    entry_ = holefit.record_found(session.path, args.hole, vision_base[:2], found, board_sha, out.name,
+                                  arm_angle_deg=arm_angle_deg(tool))
     off = np.asarray(found["xy"]) - np.asarray(vision_base[:2])
     print(f"found {args.hole} at ({found['xy'][0] * 1e3:.2f}, {found['xy'][1] * 1e3:.2f}) mm, "
           f"({off[0] * 1e3:+.2f}, {off[1] * 1e3:+.2f}) mm from vision, +-{found['sigma_m'] * 1e3:.2f} mm, "
@@ -861,16 +875,17 @@ def import_runs(session) -> list[dict]:
         found = holefit.found_from_seat(seat, free, f"seated tip ({key}, imported)")
         found["sigma_m"] += extra
         vision = plan.get("vision_hole_base_m") or plan["hole_base_m"]
-        added.append(holefit.record_found(session.path, name, vision[:2], found, sha, run_dir.name))
+        added.append(holefit.record_found(session.path, name, vision[:2], found, sha, run_dir.name,
+                                          arm_angle_deg=float(plan.get("arm_angle_deg") or 0.0)))
     return added
 
 
 def correction_entries(entries: list[dict], s: dict, holes: dict) -> list[dict]:
     """The found holes the board correction is fitted to: not those of insert.correction_exclude_shapes, whose found
     position carries their peg's own tip error (2026-11-23: the L's ~1-2 mm, not the board's, and it depends on the
-    tip file the run used)."""
+    tip file the run used), nor those found with the elbow turned (boardheight.at_elbow_zero)."""
     skip = set(s.get("correction_exclude_shapes") or [])
-    return [e for e in entries if (holes.get(e["hole"]) or {}).get("shape") not in skip]
+    return [e for e in entries if (holes.get(e["hole"]) or {}).get("shape") not in skip and boardheight.at_elbow_zero(e)]
 
 
 def _report_heights(session, sha: str | None) -> None:
@@ -969,7 +984,7 @@ def release_record(result_file: Path, hole: str, shape: str, summary: dict, plan
             "tip_offset_tcp_m": [float(v) for v in tool.tip_offset], "period_rad": float(tool.period),
             "run": result_file.parent.name, "tip_below_board_m": board_z - float(pose[11]),
             "vision_board_z_m": float(hole_base[2]),
-            "joint_offsets_rad": [float(v) for v in dq] if dq else None}
+            "joint_offsets_rad": [float(v) for v in dq] if dq else None, "arm_angle_deg": arm_angle_deg(tool)}
 
 
 def _backstop(s: dict) -> list:
@@ -1060,6 +1075,7 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     min_grasp_args = (["--min-grasp-width", f"{max(0.0006, float(tool.grasp_width_mm) / 1000.0 - 0.003):.5f}"]
                       if getattr(tool, "grasp_width_mm", None) else [])
     common = [*map(str, s["peg_search_options"]), *_tool_and_load_args(s, tool, dq), *min_grasp_args,
+              *posture_args(tool),
               "--probe-radius", f"{s['probe_radius_m']:g}", "--hole-xy", f"{hole_base[0]:.6f}", f"{hole_base[1]:.6f}",
               "--board-z", f"{hole_base[2]:.6f}", "--insert-depth", f"{insert_depth_m:g}",
               "--lift-at-end", "--yes", *map(str, search_args(lead, slide, s, pattern, error_m))]
@@ -1123,7 +1139,8 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     if hmodel is not None or n_touches == 3:
         def record_touches(points):  # `out` (this run's folder) is set below, before the plunge calls this
             z_vision = [boardheight.vision_height(peg_raw_board, data["board_surface_z_m"], p) for p in points]
-            boardheight.record(session.path, out.name, shape, board_sha, points, z_vision)
+            boardheight.record(session.path, out.name, shape, board_sha, points, z_vision,
+                               arm_angle_deg=arm_angle_deg(tool))
         z_touch = (boardheight.predict(hmodel, touch_base[:2], shape, boardheight.vision_height(
             peg_raw_board, data["board_surface_z_m"], touch_base[:2]))[0] if slope_ok and shape_known else None)
         heights_ctx = {"slope": robot_slope if hmodel is not None else None, "z_hole": z_hole_pred,
@@ -1194,7 +1211,7 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
             "start_height_mm": height_mm, "attempts": attempts, "tip_offset_tcp_mm": [float(v) * 1e3 for v in tool.tip_offset],
             "tip_source": tip_source, "settings": s, "method": method,
             "vision_hole_base_m": [float(v) for v in vision_base[:3]], "board_correction": correction,
-            "joint_offsets_rad": dq,
+            "joint_offsets_rad": dq, "arm_angle_deg": arm_angle_deg(tool),
             "search": search,
             "board_height": {"touches": n_touches, "z_hole_predicted_m": z_hole_pred, "z_vision_hole_m": z_vision_hole,
                              "model": hmodel},

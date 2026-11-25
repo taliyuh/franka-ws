@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import numpy as np
 import yaml
 
-from board_pipeline import grasp, holefit, insert, ros
+from board_pipeline import boardheight, grasp, holefit, insert, ros
 from board_pipeline.config import Config, PipelineError, load_yaml
 
 # peg_search's stage when it failed -> where the peg is afterwards (before this module's recovery)
@@ -100,6 +100,7 @@ def _vision_board(session, data: dict, dq) -> np.ndarray:
             fallback = Path(session.path) / "campaign" / "extract_found_holes.yaml"
             if fallback.exists():
                 entries = list((yaml.safe_load(fallback.read_text()) or {}).get("holes") or [])
+        entries = [en for en in entries if boardheight.at_elbow_zero(en)]  # the elbow fallback's carry its posture error
         corr = holefit.local_correction(entries, src.get("board_pose_sha256"),
                                         at_xy=hole_xy, **insert.local_options(s))
         if corr is not None:
@@ -177,15 +178,17 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
     run_dir = insert.CONTAINER_RUN_DIR
     peg_travel, hand_travel = insert.travel_heights(s)
 
-    def extract_argv(grasp_pose: np.ndarray, name: str) -> list:
+    def extract_argv(grasp_pose: np.ndarray, name: str, open_width_mm: float | None = None) -> list:
+        ow = open_width if open_width_mm is None else open_width_mm
         return [s["robot_ip"], "extract", f"{run_dir}/{name}.csv", *insert._tool_and_load_args(s, tool, dq),
                 *insert._free_speed_args(s),
-                "--grasp-pose", *(f"{v:.8f}" for v in grasp_pose.reshape(-1)), *rest,
+                "--grasp-pose", *(f"{v:.8f}" for v in grasp_pose.reshape(-1)),
+                "--open-width", f"{ow / 1000.0:.5f}", *rest,
                 "--result", f"{run_dir}/{name}.json", "--yes"]
 
     rest = [
             "--board-z", f"{board_z:.6f}", "--extract-hover-z", f"{hover_z:.6f}", "--extract-min-z", f"{min_z:.6f}",
-            "--open-width", f"{open_width / 1000.0:.5f}", "--grasp-width", f"{grasp_width / 1000.0:.5f}",
+            "--grasp-width", f"{grasp_width / 1000.0:.5f}",
             "--grasp-force", f"{float(e['grasp_force_n']):g}",
             "--grasp-eps-inner", f"{float(e['grasp_eps_inner_mm']) / 1000.0:g}",
             "--grasp-eps-outer", f"{float(e['grasp_eps_outer_mm']) / 1000.0:g}",
@@ -258,13 +261,15 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
         if insert.launch_running(cfg, s):
             insert.stop_launch(cfg, s)
         tries = 1 + int(e.get("retries", 3))
+        attempt_open_width = open_width
+        max_open_width = grasp_width + 2.0 * max(10.0, float(e["open_margin_mm"]))
         outcome["attempts"] = 0
         for k in range(1, tries + 1):
             name = "extract" if k == 1 else f"extract_{k}"
             print(f"\n== extract{f' (retry {k - 1}/{tries - 1})' if k > 1 else ''}: roof onto the peg, grasp, pull ==",
                   flush=True)
             outcome["attempts"] = k
-            code = insert.peg_search(cfg, s, out, argv if k == 1 else extract_argv(pose, name))
+            code = insert.peg_search(cfg, s, out, argv if k == 1 else extract_argv(pose, name, attempt_open_width))
             result_file = out / f"{name}.json"
             result = json.loads(result_file.read_text()) if result_file.exists() else \
                 {"ok": False, "stage": "unknown", "error": f"peg_search exited {code} without a result"}
@@ -314,6 +319,15 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
                       f"({(seated[0] - pose[0, 3]) * 1e3:+.2f}, {(seated[1] - pose[1, 3]) * 1e3:+.2f}) mm from before")
                 pose = pose.copy()
                 pose[0, 3], pose[1, 3] = float(seated[0]), float(seated[1])
+            contact_above = result.get("contact_above_board")
+            if contact_above is None and result.get("contact_tip_z") is not None:
+                contact_above = float(result["contact_tip_z"]) - board_z
+            if stage == "grasp" and contact_above is not None and float(contact_above) > -0.008:
+                wider = min(max_open_width, attempt_open_width + 6.0)
+                print(f"high contact ({float(contact_above) * 1e3:+.1f} mm from board): finger tip likely hit the peg top")
+                if wider > attempt_open_width + 1e-6:
+                    attempt_open_width = wider
+                    print(f"retry widens open width to {attempt_open_width:.1f} mm")
     finally:
         (out / "outcome.yaml").write_text(yaml.safe_dump({k: (str(v) if isinstance(v, Path) else v)
                                                           for k, v in outcome.items()}, sort_keys=False))

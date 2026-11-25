@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from board_pipeline import campaign, extract, insert, ros  # noqa: E402
+from board_pipeline import campaign, cli, extract, insert, ros  # noqa: E402
 from board_pipeline.config import Config, load_yaml  # noqa: E402
 
 PIPELINE = Path(__file__).resolve().parents[1]
@@ -34,6 +34,7 @@ def test_pipeline_yaml_speedup_defaults():
     assert s["peck_insert_depth_m"] == pytest.approx(0.010)
     assert s["centre_after_insert"] is True  # item 4 intentionally kept
     assert e["hover_mm"] == pytest.approx(6.0)
+    assert e["open_margin_mm"] == pytest.approx(7.0)
     assert e["speed_mm_s"] == pytest.approx(5.0)
     assert e["pull_speed_mm_s"] == pytest.approx(6.0)
     assert e["pull_stiffness"] == [150, 150, 4000, 70, 70, 2]
@@ -141,6 +142,34 @@ def test_campaign_zero_handover_in_libfranka_travel(tmp_path, monkeypatch):
     assert start_calls == ["start"]
 
 
+def test_fix_grasp_inserts_into_c3mm_without_centre_and_extracts_here(tmp_path, monkeypatch):
+    calls = []
+    release = {"hole": "hexagon_c3mm", "tip_pose": [float(v) for v in np.eye(4).reshape(-1)],
+               "board_z_m": 0.006, "tip_offset_tcp_m": [0.0, 0.015, 0.039]}
+
+    def fake_insert(session, args, probe_target, restart_launch=True, raise_on_fail=True):
+        calls.append(("insert", args.hole, args.no_centre, restart_launch))
+        return {"inserted": True, "stopped": None, "out": tmp_path, "summary": {"release": release}}
+
+    def fake_extract(session, args, probe_target, record=None, here=False, restart_launch=True):
+        calls.append(("extract", args.hole, here, record is release, restart_launch))
+        return {"ok": True, "peg": "hand", "out": tmp_path, "result": {"held": True}, "error": None}
+
+    monkeypatch.setattr(cli.Session, "open", staticmethod(lambda cfg, name: SimpleNamespace(path=tmp_path, cfg=cfg)))
+    monkeypatch.setattr(insert, "run", fake_insert)
+    monkeypatch.setattr(extract, "run", fake_extract)
+    monkeypatch.setattr(insert, "start_launch", lambda cfg, s: calls.append(("start_launch",)))
+    monkeypatch.setattr(campaign, "note_extracted", lambda session, hole: calls.append(("note", hole)))
+
+    cli.cmd_fix_grasp(Config.template(), SimpleNamespace(shape="hexagon", session=None, dry_run=False))
+    assert calls == [
+        ("insert", "hexagon_c3mm", True, False),
+        ("extract", "hexagon_c3mm", True, True, False),
+        ("note", "hexagon_c3mm"),
+        ("start_launch",),
+    ]
+
+
 def test_launch_kept_stopped_suppresses_ros_and_pgrep_and_restores(monkeypatch):
     cfg = Config.template()
     s = cfg["insert"]
@@ -173,3 +202,66 @@ def test_launch_kept_stopped_suppresses_ros_and_pgrep_and_restores(monkeypatch):
             raise RuntimeError("boom")
     assert ros._SKIP_CURRENT_JOINTS is False
     assert insert._ASSUME_LAUNCH_STOPPED is False
+
+
+def test_extract_widens_open_width_on_high_grasp_failure(tmp_path, monkeypatch):
+    """High contact during extract (finger bottom on peg top) triggers wider --open-width on retry, capped at +20 mm."""
+    import json
+
+    cfg = Config.template()
+    assert cfg["extract"]["open_margin_mm"] == pytest.approx(7.0)
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    session = SimpleNamespace(name="test", path=session_dir, cfg=cfg)
+    args = SimpleNamespace(hole="rectangle_c3mm", no_joint_correction=True, dry_run=False)
+    record = {
+        "hole": "rectangle_c3mm",
+        "shape": "rectangle",
+        "tip_pose": [float(v) for v in np.eye(4).reshape(-1)],
+        "board_z_m": 0.006,
+        "tip_offset_tcp_m": [0.000479, 0.015491, 0.039],
+        "run": "fake",
+    }
+
+    open_widths_m = []
+
+    def fake_peg_search(c, st, out_dir, argv):
+        ow = float(argv[argv.index("--open-width") + 1])
+        open_widths_m.append(ow)
+        res_name = Path(argv[argv.index("--result") + 1]).name
+        attempt = len(open_widths_m)
+        if attempt < 3:
+            (out_dir / res_name).write_text(json.dumps({
+                "ok": False,
+                "stage": "grasp",
+                "error": "the peg not in the V",
+                "contact_above_board": -0.0019,
+                "end_tip": [0.392, -0.077, 0.0041],
+            }))
+            return 1
+        (out_dir / res_name).write_text(json.dumps({
+            "ok": True,
+            "stage": "done",
+            "held": True,
+            "contact_above_board": -0.0205,
+            "seated_shift_xy": [0.0, 0.0],
+            "seated_turn_deg": 0.0,
+            "width": 0.0126,
+            "width_off": 0.0,
+            "pull_peak_lag_m": 0.002,
+        }))
+        return 0
+
+    monkeypatch.setattr(insert, "robot_session_dir", lambda c, st: tmp_path)
+    monkeypatch.setattr(insert, "launch_running", lambda c, st: False)
+    monkeypatch.setattr(insert, "peg_search", fake_peg_search)
+    monkeypatch.setattr(insert, "open_hand", lambda c, st, out_dir: True)
+    monkeypatch.setattr(insert, "robot_program", lambda c, st, out_dir, prog, argv: 0)
+
+    outcome = extract.run(session, args, None, record=record, here=True, restart_launch=False)
+    assert outcome["ok"] is True
+    assert outcome["attempts"] == 3
+    # rectangle grasp_width_mm = 12.679; initial margin 7 mm -> 26.679 mm, retry 1 -> +6 mm = 32.679 mm (capped at +20 mm = 32.679 mm)
+    assert open_widths_m[0] == pytest.approx(0.02668, abs=1e-5)
+    assert open_widths_m[1] == pytest.approx(0.03268, abs=1e-5)
+    assert open_widths_m[2] == pytest.approx(0.03268, abs=1e-5)

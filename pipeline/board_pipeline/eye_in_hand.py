@@ -845,14 +845,17 @@ def hole_target(session, cfg, hole: dict, name: str, tool, joint_correction: boo
     seeds = ([near] if tool.joints is not None else []) \
         + [np.r_[base[:6], base[6] + turn] for base in (seed, panda.READY)
            for turn in (0.0, -math.pi / 2, math.pi / 2, -math.pi, math.pi)]
-    # Prefer arm angle psi = 0 (elbow up, matching grasp.choose_turn and peg_search's posture rule) so the
-    # joint-offset correction and the probe/insert posture always agree; fall back to unconstrained IK if needed.
+    # Prefer the tool's arm angle psi (0, elbow up, unless grasp.choose_turn's elbow fallback turned it; peg_search
+    # holds the same) so the joint-offset correction and the probe/insert posture always agree; fall back to
+    # unconstrained IK if needed.
+    psi_want = float(getattr(tool, "arm_angle", 0.0))
     psi_good = []
     for s in seeds:
-        q, r = panda.ik(target, np.clip(np.r_[s[:2], 0.0, s[3:]], panda.LOWER, panda.UPPER), arm_angle_rad=0.0)
+        q, r = panda.ik(target, np.clip(np.r_[s[:2], 0.0, s[3:]], panda.LOWER, panda.UPPER), arm_angle_rad=psi_want)
         psi = panda.arm_angle(q)
         margin16 = float(np.min(np.minimum(q[:6] - panda.LOWER[:6], panda.UPPER[:6] - q[:6])))
-        if r < 1e-4 and psi is not None and abs(psi) < 0.05 and margin16 >= 0.15:
+        if r < 1e-4 and psi is not None and abs(math.remainder(psi - psi_want, 2 * math.pi)) < 0.05 \
+                and margin16 >= 0.15:
             psi_good.append(q)
     if psi_good:
         q_true, residual = min(psi_good, key=lambda q: np.abs(q - near).max()), 0.0

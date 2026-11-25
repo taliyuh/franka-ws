@@ -61,7 +61,7 @@ Keep the e-stop at hand whenever the arm moves.
 | `tip --hole H` | where the peg tip is now |
 | `insert --hole H` | probe approach to 6 mm above the hole, straight down until contact, else up to 5 tilt searches (rl_manip peg_search), then open the hand and lift 6 cm; no keys. It stops robot.launch for peg_search and starts it again in the background |
 | `extract --hole H` | the empty hand pulls the peg out of H: compliant descent until the fingers' roof touches the peg top, grasp (the soft hand fits the peg), compliant pull |
-| `campaign start / run / status / peg` | unattended full-board rounds: every peg 3 -> 1 -> 0.2 -> 0.03 mm, extracted in between; failed inserts parked in the 3 mm hole |
+| `campaign start / run / status / peg` | unattended full-board rounds: every peg 3 -> 1 -> 0.2 mm (row-wise), extracted in between; failed inserts parked in the 3 mm hole |
 | `accuracy` | probe 4 holes, record target vs measured, hold for photos |
 | `repeatability` | how well the arm returns to taught points |
 | `diag` | tests that find where a constant probe error comes from |

@@ -70,12 +70,27 @@ def _write(session_path: Path, touches: list[dict]) -> None:
     path.write_text(header + yaml.safe_dump({"touches": touches}, sort_keys=False))
 
 
-def record(session_path: Path, run: str, shape: str, board_sha256: str | None, points, z_vision) -> list[dict]:
-    """Add one run's touches (points: (x, y, z) base m; z_vision: vision's height at each). Replaces the run's own."""
+# Board touches and found holes (holefit, via insert.correction_entries) taken further than this from arm angle 0
+# (grasp.choose_turn's elbow fallback) carry the posture's own error (about 0.1 mm per degree, rl_manip
+# POSTURE_FINDINGS.md): kept in the files, not fitted.
+ELBOW_ZERO_DEG = 1.0
+
+
+def at_elbow_zero(touch: dict) -> bool:
+    """A touch or found hole taken with the elbow at arm angle 0 (no tag: before the elbow fallback)."""
+    return abs(float(touch.get("arm_angle_deg") or 0.0)) < ELBOW_ZERO_DEG
+
+
+def record(session_path: Path, run: str, shape: str, board_sha256: str | None, points, z_vision,
+           arm_angle_deg: float = 0.0) -> list[dict]:
+    """Add one run's touches (points: (x, y, z) base m; z_vision: vision's height at each). Replaces the run's own.
+    arm_angle_deg: the elbow they were touched at (grasp.choose_turn's elbow fallback); written when not 0, and such
+    touches are not fitted (`fit`: the posture moves the reported height about 0.1 mm per degree)."""
     touches = [t for t in load(session_path) if t.get("run") != run]
     now = datetime.datetime.now().isoformat(timespec="seconds")
+    extra = {"arm_angle_deg": float(arm_angle_deg)} if arm_angle_deg else {}
     new = [{"run": run, "shape": shape, "xy": [float(p[0]), float(p[1])], "z": float(p[2]), "z_vision": float(zv),
-            "board_sha256": board_sha256, "time": now} for p, zv in zip(points, z_vision)]
+            "board_sha256": board_sha256, "time": now, **extra} for p, zv in zip(points, z_vision)]
     _write(session_path, touches + new)
     return new
 
@@ -110,7 +125,8 @@ def backfill(session_path: Path) -> int:
         src = target.get("source") or {}
         board = np.asarray(src.get("T_base_board_true_frame") or target["T_base_board"])
         z_vision = [vision_height(board, float(target["board_surface_z_m"]), p) for p in points]
-        record(session_path, run_dir.name, plan["shape"], src.get("board_pose_sha256"), points, z_vision)
+        record(session_path, run_dir.name, plan["shape"], src.get("board_pose_sha256"), points, z_vision,
+               arm_angle_deg=float(plan.get("arm_angle_deg") or 0.0))
         added += 1
     return added
 
@@ -120,8 +136,9 @@ def fit(touches: list[dict], board_sha256: str | None, shape_prior_m: float = 0.
     """z - z_vision = c + g . (xy - centre) + o_shape (the grasp of that shape) over the touches of this board pose
     (least squares, Gaussian
     priors: o_shape shape_prior_m, g slope_prior; the shapes' offsets sum to zero over the shapes seen, c their mean).
-    None without touches."""
-    use = [t for t in touches if board_sha256 is None or t.get("board_sha256") == board_sha256]
+    None without touches. Touches taken with the elbow turned (arm_angle_deg, the elbow fallback) are left out."""
+    use = [t for t in touches if (board_sha256 is None or t.get("board_sha256") == board_sha256)
+           and at_elbow_zero(t)]
     if not use:
         return None
     xy = np.array([t["xy"] for t in use], float)
@@ -170,7 +187,8 @@ def predict(model: dict, xy, shape: str, z_vision: float) -> tuple[float, bool]:
 def leave_one_run_out(touches: list[dict], board_sha256: str | None) -> list[dict]:
     """Each run's touches predicted from the other runs': with none of its own, and with its first touch setting its
     grasp's offset (what insert does with board_touches 1)."""
-    use = [t for t in touches if board_sha256 is None or t.get("board_sha256") == board_sha256]
+    use = [t for t in touches if (board_sha256 is None or t.get("board_sha256") == board_sha256)
+           and at_elbow_zero(t)]
     out = []
     for run in sorted({t["run"] for t in use}):
         own = [t for t in use if t["run"] == run]

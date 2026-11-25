@@ -341,7 +341,7 @@ extract:
   approach_height_mm: 40.0   # probe_board over the hole, without insert.hand_travel_mm (which replaces it)
   hover_mm: 6.0              # the compliant descent starts this far above the expected peg tip (release, else board)
   max_depth_mm: 24.0         # no peg top felt with the tip this far below the board: fail (the pocket is ~22 mm)
-  open_margin_mm: 4.0        # each finger off the peg during the descent (seat width + 2 x this; L: 27.4 mm)
+  open_margin_mm: 7.0        # each finger off the peg during the descent (seat width + 2 x this; 7 mm gives +-4.1 mm x-clearance in the 60 deg V for leaning pegs while keeping >= 80 mm2 roof overlap)
   # N/m x y z, Nm/rad roll pitch yaw (base axes, at the tip). descent_stiffness until the roof is on the peg (robot
   # 2026-11-23: soft from the start, the empty hand drifted 6 mm and 0.8 deg in free air in 2 s: the model's ~2 N
   # error); stiffness from the grasp on, plus the stiff spring's mean wrench during the press held as a feed-forward.
@@ -360,7 +360,7 @@ extract:
   speed_mm_s: 5.0
   # The roof on the peg top: the tip held back 1 mm behind the descent (every real touch, 2026-11-23); the z force's
   # change faster than its 0.25 s mean only as a backstop (4 N: a free-air blip was taken for the peg, 22 mm up).
-  contact_force_n: 10.0
+  contact_force_n: 15.0
   press_n: 3.0               # down on the peg top while the fingers close
   pull_speed_mm_s: 6.0
   pull_max_lag_mm: 5.5       # the tip this far behind the pull (~22 N at 4000 N/m): target clamps until peg moves
@@ -387,9 +387,11 @@ extract:
 campaign:
   rounds: 20
   shapes: [round, hexagon, triangle, rectangle, l_shape]
-  clearances: [c3mm, c1mm, c0p2mm, c0p03mm]
-  start_clearance: c0p03mm
+  clearances: [c3mm, c1mm, c0p2mm]
+  start_clearance: c0p2mm
   park_clearance: c3mm
   # stop (default): any extract failure stops the campaign (2026-11-23: skip_shape went through three shapes with the
   # same systematic failure). skip_shape: a peg left in its hole blocks only its shape.
   on_extract_failure: stop
+  # Holes inserted with --no-board-correction during campaigns (e.g. temporary workaround).
+  no_board_correction_holes: [l_shape_c3mm]

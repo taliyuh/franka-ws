@@ -1,8 +1,8 @@
-"""`pipeline campaign`: full-board insertions, unattended (2026-11-23: 20 rounds x 20 holes to validate insert).
+"""`pipeline campaign`: full-board insertions, unattended (2026-11-23: 20 rounds x 15 holes to validate insert).
 
-Each peg starts in its tightest hole (campaign.start_clearance, c0p03mm). A round goes row-wise through
-campaign.clearances (3 -> 1 -> 0.2 -> 0.03 mm) across all shapes in campaign.shapes: extract the peg from where it is,
-insert it into the target hole, and so on; the round ends with every peg back in its 0.03 mm hole, where the next
+Each peg starts in its tightest campaign hole (campaign.start_clearance, c0p2mm). A round goes row-wise through
+campaign.clearances (3 -> 1 -> 0.2 mm) across all shapes in campaign.shapes: extract the peg from where it is,
+insert it into the target hole, and so on; the round ends with every peg back in its 0.2 mm hole, where the next
 round starts. With travel=libfranka, robot.launch stays stopped for the whole campaign.
 
 A peg that does not go in (insert lifts it with the peg) is parked in its 3 mm hole (campaign.park_clearance, skipping
@@ -12,7 +12,7 @@ campaign.on_extract_failure is skip_shape (default: stop). Anything that leaves 
 campaign.
 
 Within each round (episode), insert learns about the holes from inserting only (found holes, board correction) and
-shares that knowledge across the 20 insertions of that round; at the end of every round (and on `campaign start`),
+shares that knowledge across the 15 insertions of that round; at the end of every round (and on `campaign start`),
 <session>/insert/found_holes.yaml is archived into <session>/campaign/ so the next episode starts without XY hole
 corrections from previous episodes. A pre-campaign snapshot is kept at <session>/campaign/extract_found_holes.yaml so
 `extract` can still use it while insert starts clean. The Z board height model (<session>/insert/board_heights.yaml) is
@@ -195,10 +195,12 @@ def new_state(holes: dict, c: dict, iterations: int, shapes: list[str]) -> dict:
             "pegs": {shape: {"at": f"{shape}_{c['start_clearance']}", "record": None} for shape in shapes}}
 
 
-def _insert_args(args, hole: str, park: bool = False) -> SimpleNamespace:
+def _insert_args(args, hole: str, park: bool = False, no_board_correction_holes=()) -> SimpleNamespace:
     return SimpleNamespace(hole=hole, attempts=None, height=None, tip_from=None, turn=0.0,
                            no_joint_correction=False, slide_dir=None, pattern=None, search=None, method=None,
-                           touches=None, no_board_correction=getattr(args, "no_board_correction", False),
+                           touches=None,
+                           no_board_correction=bool(getattr(args, "no_board_correction", False)
+                                                    or hole in (no_board_correction_holes or ())),
                            no_centre=park, no_record=park, here=False, dry_run=False)
 
 
@@ -260,7 +262,9 @@ def _insert(session, args, probe_target, state, shape, hole, role) -> dict:
     state["pending"] = {"action": role, "shape": shape, "hole": hole}
     save_state(session, state)
     started = time.monotonic()
-    outcome = insert.run(session, _insert_args(args, hole, park=(role == "park")), probe_target,
+    skip_corr = settings(cfg).get("no_board_correction_holes") or ()
+    outcome = insert.run(session, _insert_args(args, hole, park=(role == "park"),
+                                               no_board_correction_holes=skip_corr), probe_target,
                          restart_launch=False, raise_on_fail=False)
     summary = outcome["summary"]
     stopped = outcome["stopped"] or ""

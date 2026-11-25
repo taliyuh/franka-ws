@@ -193,11 +193,15 @@ def load_found(session_path: Path) -> list[dict]:
     return list((yaml.safe_load(path.read_text()) or {}).get("holes") or [])
 
 
-def record_found(session_path: Path, hole: str, vision_xy, found: dict, board_sha256: str, run: str) -> dict:
+def record_found(session_path: Path, hole: str, vision_xy, found: dict, board_sha256: str, run: str,
+                 arm_angle_deg: float = 0.0) -> dict:
+    """arm_angle_deg: the elbow the hole was found at (grasp.choose_turn's elbow fallback); written when not 0."""
     entry = {"hole": hole, "vision_xy": [float(v) for v in np.asarray(vision_xy, float)[:2]],
              "found_xy": [float(v) for v in found["xy"]], "sigma_m": float(found["sigma_m"]),
              "source": found["source"], "board_sha256": board_sha256, "run": run,
              "time": datetime.datetime.now().isoformat(timespec="seconds")}
+    if arm_angle_deg:
+        entry["arm_angle_deg"] = float(arm_angle_deg)
     entries = load_found(session_path) + [entry]
     path = found_path(session_path)
     path.parent.mkdir(parents=True, exist_ok=True)

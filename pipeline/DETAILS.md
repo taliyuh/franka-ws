@@ -580,16 +580,15 @@ fingertips are ~30 mm above the tip). Without them: `lift_m` and the probe's 20 
 Full-board rounds, unattended (`board_pipeline/campaign.py`, the config's `campaign` section).
 
 ```bash
-./pipeline/pipeline campaign start            # pegs in their 0.03 mm holes, hand empty
+./pipeline/pipeline campaign start            # pegs in their 0.2 mm holes, hand empty
 ./pipeline/pipeline campaign run --dry-run    # the inserts left
 ./pipeline/pipeline campaign run              # resumable; --max-inserts N to stop early
 ./pipeline/pipeline campaign status           # where the pegs are, success per hole
 ```
 
-Each round takes every shape through c3mm -> c1mm -> c0p2mm -> c0p03mm: extract from where the peg is, insert
-into the next hole (robot.launch stays stopped after the insert: the extract right after it starts from over the
-released peg, no ROS approach). A peg that does not go in is parked in its c3mm hole and taken from there for the
-next hole. A failed extract stops the campaign (`on_extract_failure: stop`; with skip_shape a peg left in its hole
+Each round goes row-wise through c3mm -> c1mm -> c0p2mm across all shapes: extract from where the peg is, insert
+into the next hole (robot.launch stays stopped for the campaign). A peg that does not go in is parked in its c3mm hole and taken from there for the
+next clearance. A failed extract stops the campaign (`on_extract_failure: stop`; with skip_shape a peg left in its hole
 blocks only its shape). Anything else that leaves a peg somewhere unknown, or a run stopped mid-action (Ctrl-C),
 stops the campaign: look, then `campaign peg SHAPE --at HOLE|hand [--from-run RUN]` and run again.
 `sessions/<name>/campaign/`: state.yaml, results.csv (one row per insert, park, extract, skip).

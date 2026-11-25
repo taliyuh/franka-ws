@@ -68,11 +68,11 @@ def test_plan_covers_every_hole_in_order():
     c = Config.template()["campaign"]
     state = campaign.new_state(HOLES, c, 2, list(c["shapes"]))
     plan = campaign._plan(state)
-    assert len(plan) == 2 * 5 * 4
+    assert len(plan) == 2 * 5 * 3
     assert [h for _, _, h in plan[:6]] == [
         "round_c3mm", "hexagon_c3mm", "triangle_c3mm", "rectangle_c3mm", "l_shape_c3mm", "round_c1mm"
     ]
-    for _ in range(4 * 5):
+    for _ in range(3 * 5):
         campaign._advance(state)
     assert (state["round"], state["shape_index"], state["step"]) == (2, 0, 0)
 
@@ -154,24 +154,24 @@ def test_campaign_round_moves_every_peg_through_its_holes(setup):
     campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
     state = campaign.load_state(session)
     assert state["round"] == 2
-    assert state["pegs"]["round"]["at"] == "round_c0p03mm" and state["pegs"]["hexagon"]["at"] == "hexagon_c0p03mm"
+    assert state["pegs"]["round"]["at"] == "round_c0p2mm" and state["pegs"]["hexagon"]["at"] == "hexagon_c0p2mm"
     assert robot.calls[:6] == [
-        ("extract", "round_c0p03mm", False), ("insert", "round_c3mm"),
-        ("extract", "hexagon_c0p03mm", False), ("insert", "hexagon_c3mm"),
+        ("extract", "round_c0p2mm", False), ("insert", "round_c3mm"),
+        ("extract", "hexagon_c0p2mm", False), ("insert", "hexagon_c3mm"),
         ("extract", "round_c3mm", False), ("insert", "round_c1mm"),
     ]
     rows = (session.path / "campaign" / "results.csv").read_text().splitlines()
-    assert len(rows) == 1 + 2 * 4 * 2  # header, an extract and an insert per hole
+    assert len(rows) == 1 + 2 * 3 * 2  # header, an extract and an insert per hole
 
 
 def test_a_failed_insert_parks_the_peg_and_the_next_hole_takes_it_from_there(setup):
-    session, robot = setup(fail={"round_c0p2mm"}, shapes=("round",))
+    session, robot = setup(fail={"round_c1mm"}, shapes=("round",))
     campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
-    i = robot.calls.index(("insert", "round_c0p2mm"))
+    i = robot.calls.index(("insert", "round_c1mm"))
     assert robot.calls[i + 1] == ("insert", "round_c3mm")          # parked
     assert robot.calls[i + 2] == ("extract", "round_c3mm", True)   # taken from there
-    assert robot.calls[i + 3] == ("insert", "round_c0p03mm")
-    assert campaign.load_state(session)["pegs"]["round"]["at"] == "round_c0p03mm"
+    assert robot.calls[i + 3] == ("insert", "round_c0p2mm")
+    assert campaign.load_state(session)["pegs"]["round"]["at"] == "round_c0p2mm"
     park_idx = [idx for idx, a in enumerate(robot.insert_args) if a.no_centre]
     assert len(park_idx) == 1
     assert robot.insert_args[park_idx[0]].hole == "round_c3mm"
@@ -180,20 +180,20 @@ def test_a_failed_insert_parks_the_peg_and_the_next_hole_takes_it_from_there(set
 
 
 def test_a_stuck_peg_stops_the_campaign_by_default(setup):
-    session, robot = setup(stuck={"round_c0p03mm"})
+    session, robot = setup(stuck={"round_c0p2mm"})
     with pytest.raises(Exception, match="extracting the round peg failed"):
         campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
-    assert campaign.load_state(session)["pegs"]["round"]["at"] == "round_c0p03mm"
+    assert campaign.load_state(session)["pegs"]["round"]["at"] == "round_c0p2mm"
     assert not any(c[0] == "insert" for c in robot.calls)
 
 
 def test_a_stuck_peg_blocks_its_shape_and_the_others_go_on(setup):
-    session, robot = setup(stuck={"round_c0p03mm"})
+    session, robot = setup(stuck={"round_c0p2mm"})
     session.cfg.data["campaign"]["on_extract_failure"] = "skip_shape"
     campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
     state = campaign.load_state(session)
-    assert "round" in state["blocked"] and state["pegs"]["round"]["at"] == "round_c0p03mm"
-    assert ("insert", "hexagon_c0p03mm") in robot.calls
+    assert "round" in state["blocked"] and state["pegs"]["round"]["at"] == "round_c0p2mm"
+    assert ("insert", "hexagon_c0p2mm") in robot.calls
     assert not any(c[0] == "insert" and c[1].startswith("round") for c in robot.calls)
 
 
@@ -226,8 +226,8 @@ def test_found_holes_isolated_per_round_and_start_archives_files(setup):
     assert heights_file.exists()
 
     campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
-    # 2 rounds * 4 clearances * 2 shapes = 16 inserts: round 1 grows 0..7, round 2 resets to 0..7
-    assert [cnt for _, cnt in robot.found_counts_at_insert] == list(range(8)) + list(range(8))
+    # 2 rounds * 3 clearances * 2 shapes = 12 inserts: round 1 grows 0..5, round 2 resets to 0..5
+    assert [cnt for _, cnt in robot.found_counts_at_insert] == list(range(6)) + list(range(6))
     assert (session.path / "campaign" / "found_holes_round_1.yaml").exists()
     assert (session.path / "campaign" / "found_holes_round_2.yaml").exists()
     assert not holefit.found_path(session.path).exists()
@@ -290,6 +290,16 @@ def test_attempts_csv_and_status_metrics(setup, capsys):
     out = capsys.readouterr().out
     assert "retries/ins" in out
     assert "by clearance" in out
-    assert "insert overall: 7/8 (88%), plunge 6, tilt 1" in out
-    assert "avg retries/insertion 0.25" in out
+    assert "insert overall: 5/6 (83%), plunge 4, tilt 1" in out
+    assert "avg retries/insertion 0.33" in out
     assert "parks: 1/1 into the c3mm holes" in out
+
+
+def test_no_board_correction_holes_setting(setup):
+    session, robot = setup(shapes=("round", "l_shape"), rounds=1)
+    campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
+    by_hole = {a.hole: a.no_board_correction for a in robot.insert_args}
+    assert by_hole["l_shape_c3mm"] is True
+    for h, flag in by_hole.items():
+        if h != "l_shape_c3mm":
+            assert flag is False, f"expected no_board_correction=False for {h}"
