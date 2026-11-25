@@ -1,0 +1,84 @@
+# MediaMTX config for the lab camera on 827 (prorocpc2).
+# Only keys that differ from the defaults are set; see
+# https://github.com/bluenviron/mediamtx/blob/main/mediamtx.yml for the rest.
+#
+# 827 has a public university address on enp3s0, so every server that can
+# be reached from outside binds to the Tailscale address only (or loopback).
+# The Tailscale-bound addresses below are placeholders: docker-compose.yml
+# overrides them from TS_IP in .env via MediaMTX's MTX_* environment variables.
+
+logLevel: info
+logDestinations: [stdout]
+
+# Viewers from the tailnet may read and fetch recordings; only processes on
+# this machine may publish or use the control API.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+      - action: playback
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: publish
+      - action: api
+      - action: metrics
+
+# Control API (enable/inspect paths, list recordings): loopback only.
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# Playback server: download any time range from the recordings, e.g.
+#   http://<ts-ip>:9996/list?path=cam
+#   http://<ts-ip>:9996/get?path=cam&start=2026-11-25T02:10:00Z&duration=120
+playback: yes
+playbackAddress: 127.0.0.1:9996
+
+# RTSP: ffmpeg publishes here; loopback only, TCP only (no UDP port range).
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+rtspEncryption: "no"
+
+rtmp: no
+srt: no
+# MoQ (new in 1.21) listens on all interfaces by default: off.
+moq: no
+
+# WebRTC: the low-latency browser page  http://<ts-ip>:8889/cam
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcLocalTCPAddress: ''
+webrtcIPsFromInterfaces: no
+webrtcAdditionalHosts: []
+
+# HLS: a few seconds behind, but plain HTTP, so it also works through
+# `tailscale funnel` for colleagues outside the tailnet. Loopback only: the
+# gate service (Caddyfile) serves it on <ts-ip>:8888 and asks Funnel
+# viewers for the password.
+hls: yes
+hlsAddress: 127.0.0.1:8888
+hlsVariant: mpegts
+hlsSegmentDuration: 2s
+
+pathDefaults:
+  record: yes
+  # Container clock is UTC; %z (a trailing Z) keeps names unambiguous anyway.
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f%z
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1h
+  # 2 Mbit/s ~ 0.9 GB/h ~ 22 GB/day if left running round the clock.
+  # Copy runs to the external drive with scripts/archive.sh before this expires.
+  recordDeleteAfter: 7d
+
+paths:
+  cam:
+    runOnInit: /camstream/capture.sh
+    runOnInitRestart: yes
+    runOnAvailable: /camstream/snapshot.sh
+    runOnAvailableRestart: yes

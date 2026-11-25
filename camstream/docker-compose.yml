@@ -1,0 +1,68 @@
+# Lab camera: live view + continuous recording on 827.
+#   cp .env.example .env    # then edit
+#   docker compose up -d
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.4-ffmpeg
+    container_name: camstream
+    restart: unless-stopped
+    # Run as the host user so recordings and snapshots are yours to move or
+    # delete. Set CAM_UID/CAM_GID in .env. Camera nodes belong to the host's
+    # `video` (44) or, with the RealSense udev rules, `plugdev` (46) group;
+    # numeric because the container's own `video` group has a different id.
+    user: "${CAM_UID:-1001}:${CAM_GID:-1004}"
+    group_add: ["44", "46"]
+    # Host network: binds straight to the Tailscale address (see mediamtx.yml).
+    network_mode: host
+    env_file: .env
+    environment:
+      TZ: UTC
+      MTX_PATH: cam
+      RTSP_PORT: "8554"
+      # Viewer-facing servers bind to the Tailscale address only.
+      MTX_PLAYBACKADDRESS: ${TS_IP:?set TS_IP in .env}:9996
+      MTX_WEBRTCADDRESS: ${TS_IP}:8889
+      MTX_WEBRTCLOCALUDPADDRESS: ${TS_IP}:8189
+      MTX_WEBRTCADDITIONALHOSTS: ${TS_IP}
+      # HLS sits behind the gate service (Caddyfile) on ${TS_IP}:8888.
+      MTX_HLSADDRESS: 127.0.0.1:8888
+      MTX_PATHDEFAULTS_RECORDDELETEAFTER: ${RECORD_KEEP:-7d}
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+      - ./capture.sh:/camstream/capture.sh:ro
+      - ./snapshot.sh:/camstream/snapshot.sh:ro
+      - /usr/share/fonts/truetype/dejavu:/fonts:ro
+      - ${RECORDINGS_DIR:-./recordings}:/recordings
+      - ./snapshots:/snapshots
+      # Cameras: /dev is shared so a RealSense plugged in later shows up
+      # without recreating the container; the cgroup rule allows only
+      # V4L2 devices (char major 81).
+      - /dev:/dev
+    device_cgroup_rules:
+      - 'c 81:* rmw'
+    # Keep encoding off the cores the robot control loop runs on.
+    cpuset: ${CAM_CPUSET:-0-19}
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }
+
+  # Password for viewers coming in through `tailscale funnel`; tailnet
+  # devices pass without one. See Caddyfile.
+  gate:
+    image: caddy:2.11.9-alpine
+    container_name: camstream-gate
+    restart: unless-stopped
+    network_mode: host
+    user: "${CAM_UID:-1001}:${CAM_GID:-1004}"
+    environment:
+      TS_IP: ${TS_IP}
+      VIEWER_USER: ${VIEWER_USER:-viewer}
+      VIEWER_PASS_HASH: ${VIEWER_PASS_HASH:?run scripts/set-password.sh}
+      XDG_DATA_HOME: /tmp
+      XDG_CONFIG_HOME: /tmp
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on: [mediamtx]
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }

@@ -1,0 +1,23 @@
+# Front door for the HLS page on the Tailscale address (TS_IP:8888).
+#
+# `tailscale funnel` forwards public requests from 827's own Tailscale
+# address, so those (and only those) must log in. Tailnet devices connect
+# from their own 100.x address and get straight through. remote_ip is the
+# TCP peer, not X-Forwarded-For, so it cannot be spoofed by the client.
+# Requests without the password never reach MediaMTX.
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+:8888 {
+	bind {$TS_IP}
+
+	@funnel remote_ip {$TS_IP}/32
+	basic_auth @funnel {
+		{$VIEWER_USER} {$VIEWER_PASS_HASH}
+	}
+
+	reverse_proxy 127.0.0.1:8888
+}
