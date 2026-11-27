@@ -61,7 +61,7 @@ webrtcAdditionalHosts: []
 # gate service (Caddyfile) serves it on <ts-ip>:8888 and asks Funnel
 # viewers for the password.
 hls: yes
-hlsAddress: 127.0.0.1:8888
+hlsAddress: 127.0.0.1:8887
 hlsVariant: mpegts
 hlsSegmentDuration: 2s
 

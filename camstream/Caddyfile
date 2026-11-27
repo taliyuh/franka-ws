@@ -14,10 +14,16 @@
 :8888 {
 	bind {$TS_IP}
 
+	# One line per request (status, path, user agent) in `docker compose logs gate`.
+	log {
+		output stdout
+		format console
+	}
+
 	@funnel remote_ip {$TS_IP}/32
 	basic_auth @funnel {
 		{$VIEWER_USER} {$VIEWER_PASS_HASH}
 	}
 
-	reverse_proxy 127.0.0.1:8888
+	reverse_proxy 127.0.0.1:8887
 }

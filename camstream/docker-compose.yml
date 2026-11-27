@@ -24,8 +24,9 @@ services:
       MTX_WEBRTCADDRESS: ${TS_IP}:8889
       MTX_WEBRTCLOCALUDPADDRESS: ${TS_IP}:8189
       MTX_WEBRTCADDITIONALHOSTS: ${TS_IP}
-      # HLS sits behind the gate service (Caddyfile) on ${TS_IP}:8888.
-      MTX_HLSADDRESS: 127.0.0.1:8888
+      # HLS sits behind the gate service (Caddyfile) on ${TS_IP}:8888; 8887
+      # internally because something else on 827 takes 127.0.0.1:8888 at boot.
+      MTX_HLSADDRESS: 127.0.0.1:8887
       MTX_PATHDEFAULTS_RECORDDELETEAFTER: ${RECORD_KEEP:-7d}
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
