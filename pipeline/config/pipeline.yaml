@@ -157,6 +157,9 @@ insert:
   # stuck: the first one is a compliant plunge at that spot (the hold presses it in). Before each later attempt the
   # peg is turned upright at the start height (position control). peck: a grid of plunges. tilt: the old attempts.
   method: plunge
+  # Holes this tight or tighter get no plunge (0.2 and 0.03 mm; 2026-11-25: the plunge took 5 of 25 at 0.2 mm, each
+  # miss ~8-10 s): the board touches only (peck --peck-max-points 0, at least one touch), then the tilt search.
+  no_plunge_max_clearance_mm: 0.2
   touch_offset_m: 0.022
   # The board height model (board_pipeline/boardheight.py, 2026-11-23): every touch kept in
   # <session>/insert/board_heights.yaml; robot - vision height = a plane over the board + one offset per shape's grasp
@@ -213,6 +216,10 @@ insert:
   # each taken for a jam and pulled back out; released after an interrupt it dropped in.
   tight_insert_depth_m: 0.004
   centre_touches: 6
+  centre_min_verify_contacts: 2
+  tilt_wall_sigma_m: 0.0008
+  tilt_seat_sigma_m: 0.001
+  correction_exclude_tilt_seats: true
   centre_options: []
   # How the tilt search attempts are aimed (board_pipeline/beliefgrid.py, 2026-11-21; --search): grid: a probability
   # grid of the hole (prior: vision, sigma half the error disc) updated from every attempt's 1 kHz log (missed lines,
@@ -244,6 +251,13 @@ insert:
   # Base-frame slide direction preferred among a shape's equivalent leads (2026-11-12: tilting about base y,
   # i.e. sliding along base x, vibrated the wrist at ~45 Hz; base +y worked).
   slide_dir_base_deg: 90.0
+  # The round peg (any slide direction is the same to its hole): a random one each insert, so the tilt search does not
+  # press along the same path of the board every time (2026-11-27); kept only if the tilted hand reaches both ends of
+  # the outer lines with every joint round_slide_joint_margin_rad inside its limits (nominal IK, the approach's arm
+  # angle), else the next of round_slide_tries draws, else slide_dir_base_deg. --slide-dir sets it.
+  round_slide_random: true
+  round_slide_tries: 12
+  round_slide_joint_margin_rad: 0.1
   # Lead group per shape (tilt_leads.yaml group; none: the simulation's order, group 0 first). The L-shape: group 0
   # the long arm's end corner (corner@225, 14 mm from the centroid, 8.3 mm beside the tip's line; the simulation's
   # best at 3 / 1 mm, 0.75 / 0.69), group 1 the outer elbow corner (corner@45, 12 mm out, 3.7 mm beside; 0.69 /
@@ -296,7 +310,8 @@ insert:
                        # A run after a failed one may start ~26 mm above the board; inserted is 15 mm below it.
                        --max-descent, "0.05",
                        # the tare's limit on the torque-sensor wrench at rest (the load model's error)
-                       --max-bias, "15"]
+                       --max-bias, "15",
+                       --max-tip-speed, "0.12"]
   # probe_board for insert: one 20 mm descent move and this settle tolerance (not 3 mm steps to 0.2 mm, ~36 s).
   probe_tolerance_m: 0.001
   probe_tolerance_rad: 0.005
@@ -310,9 +325,47 @@ insert:
   link6_load_mass_kg: 0.55
   link6_load_com_m: [-0.018, 0.013, 0.077]
   release_width_mm: 30.0
+  # Release after an insert: open only to the peg's grasp width + this (capped at release_width_mm); extract keeps
+  # release_width_mm. 2026-11-25: 30 mm around the triangle hit the hexagon seated next to it in the 0.2 mm row.
+  release_margin_mm: 8.0
+  # Minimum 2D clearance (mm) between the opened v3 fingers and any other-shape hole on the board; dynamically caps
+  # release_width (and extract open_width) on tight spots like l_shape_c0p2mm next to rectangle_c0p2mm. null/0: off.
+  neighbor_clearance_mm: 2.5
+  # Per-hole insert settings over this section's (insert.hole_overrides). Corner-in (start_in_hole_m): the lead (a
+  # corner; the hexagon's flat edge, corner_in_edge_shapes) starts inside the hole's near rim instead of sliding onto
+  # it across the board, at corner_in_near_fraction x the near rim distance within [corner_in_min_m, corner_in_max_m],
+  # never past where the lead dips (corner_in_dip_cap). corner_in (insert --corner-in, campaign run --corner-in): auto
+  # on the shapes of corner_in_shapes at most corner_in_max_clearance_mm (null: any) once corner_in_min_found_holes
+  # holes of this board pose are found; on any corner / edge shape, found holes or not; off never. Not with the spiral
+  # or method tilt / peck (peg_search needs lines and the touches' board plane). 2026-11-27: triangle, rectangle,
+  # hexagon robot-tested at 0.2 / 0.03 mm; L-shape started outside with its CAD tip (v3 fingers, ~1.1 mm off) and no
+  # board correction. Default since then: every shape but round, every clearance, no found-hole gate.
+  # corner_in_attempts caps the attempts on holes at most corner_in_attempts_max_clearance_mm (loose: insert.attempts).
+  slide_lag_margin_m: 0.004
+  max_shallow_attempts: 2
+  corner_in: auto
+  corner_in_shapes: [triangle, rectangle, l_shape, hexagon]
+  corner_in_edge_shapes: [hexagon]
+  corner_in_max_clearance_mm: null
+  corner_in_min_found_holes: 0
+  corner_in_near_fraction: 0.55
+  corner_in_min_m: 0.0025
+  corner_in_max_m: 0.0045
+  corner_in_dip_cap: true
+  corner_in_attempts: 2
+  corner_in_attempts_max_clearance_mm: 0.2
+  hole_overrides: {}
   # peg_search lift's force-change backstop (the torque-sensor wrench steps ~15-20 N when a move starts; 25 N stopped
   # the 15 cm lifts after the rectangle and L-shape releases, 2026-11-21). The tip-tracking check guards contact.
   lift_max_force_change: 50
+  # A move_to_hole stopped only by that backstop with the tip still at its planned heights (within
+  # free_air_trip_margin_mm) is control-loop jitter, not a touch (2026-11-25 20:38, 21:04: 10 -> 30 -> 10 -> 45 N within
+  # ms, mid-air): wait free_air_trip_wait_s and move again, up to free_air_trip_retries times; with a peg only if the
+  # hand still holds it (grasped, within free_air_held_eps_mm [inner, outer] of its seat width).
+  free_air_trip_retries: 1
+  free_air_trip_margin_mm: 5.0
+  free_air_trip_wait_s: 1.0
+  free_air_held_eps_mm: [3.0, 1.0]
   # A touched board this far from vision's is a false contact: vision's is used instead.
   board_max_off_m: 0.003
   # peg_search lift (libfranka joint position controller, 10 mm/s) after the release, after a run that did not insert
@@ -340,12 +393,24 @@ insert:
 extract:
   approach_height_mm: 40.0   # probe_board over the hole, without insert.hand_travel_mm (which replaces it)
   hover_mm: 6.0              # the compliant descent starts this far above the expected peg tip (release, else board)
+  min_hover_above_board_mm: 2.0  # never drive stiff hover descent below +2 mm above the board (avoids hitting peg top)
+  upright_from_record: true  # level release pose to board normal (strips tilt-insert lean while keeping symmetry yaw)
   max_depth_mm: 24.0         # no peg top felt with the tip this far below the board: fail (the pocket is ~22 mm)
-  open_margin_mm: 7.0        # each finger off the peg during the descent (seat width + 2 x this; 7 mm gives +-4.1 mm x-clearance in the 60 deg V for leaning pegs while keeping >= 80 mm2 roof overlap)
+  # Each finger off the peg during the descent (seat width + 2 x this). 7 mm with the v2 fingers; the v3 fingers
+  # (2026-11-27) are bigger and their seat widths +3 mm: 7 mm opened 29.5 mm around the hexagon and nearly hit the peg
+  # next to it. A retry after a high contact widens by 6 mm, to at most seat width + 2 x retry_max_open_margin_mm.
+  open_margin_mm: 4.5
+  retry_max_open_margin_mm: 6.0
+  # Minimum 2D clearance (mm) between opened v3 fingers and any other-shape hole on the board (caps open_width and
+  # retry widening on tight holes such as l_shape_c0p2mm next to rectangle_c0p2mm). null/0: off.
+  neighbor_clearance_mm: 2.5
+  min_open_margin_mm: 1.5
   # N/m x y z, Nm/rad roll pitch yaw (base axes, at the tip). descent_stiffness until the roof is on the peg (robot
   # 2026-11-23: soft from the start, the empty hand drifted 6 mm and 0.8 deg in free air in 2 s: the model's ~2 N
-  # error); stiffness from the grasp on, plus the stiff spring's mean wrench during the press held as a feed-forward.
-  descent_stiffness: [3000, 3000, 4000, 200, 200, 20]
+  # error; 2026-11-27: [3000, 3000, 4000, 200, 200, 20] drove joint 6 into a 30-33 Hz free-air limit cycle at extended
+  # reach on c0p2mm/c0p03mm holes, tripping --max-tip-speed / --max-rot-speed); stiffness from the grasp on, plus the
+  # stiff spring's mean wrench during the press held as a feed-forward.
+  descent_stiffness: [1200, 1200, 2000, 80, 80, 20]
   stiffness: [300, 300, 4000, 20, 20, 2]
   # The pull (robot 2026-11-23, hexagon): with the grasp's 20 Nm/rad tilt the hand pitched 0.6-1.9 deg on the way up
   # and jammed the peg in the 0.03 mm hole (15 N, stick-slip). It keeps the orientation the peg had seated deep in the
@@ -373,12 +438,34 @@ extract:
   # `retries` more attempts in place (aimed where the fingers seated on the peg, if they got that far).
   retries: 3
   retry_above_hover_mm: 5.0
+  same_failure_contact_tol_mm: 1.0  # stop retrying if two in-hole attempts fail identically at the same contact height
+  # A held grasp is trusted only if (robot 2026-11-25, 130 extracts): the roof touched within contact_tol_mm of the
+  # pocket (good: -20.7..-22.9 mm; a finger on the hexagon top: -3.7), the hand's width within width_tol_mm of the
+  # shape's normal width off the seat (the hexagon held by its top: -2.95; an L slipped 16 mm: -2.44 vs -1.44), and
+  # (peg_search's grasp_width_seated) the width changed at most slip_tol_mm from the grasp to the end of the pull.
+  # Not trusted: put_back (the peg upright over its seat, put_back_hover_mm up, down until put_back_above_seat_mm over
+  # it at a put_back_force_change_n stop, open, retry); stopped more than put_back_max_short_mm over the seat: the hand
+  # keeps it and the campaign stops with it in the hand.
+  grasp_gate:
+    contact_mm: -22.0
+    contact_tol_mm: 3.0
+    # v3 fingers (2026-11-27): hexagon -0.21 from one good extract (roof -21.5 mm); the others are not measured
+    # yet, so their width check is off (v2 values: round -0.80, hexagon -0.77, triangle -0.64, rectangle -1.25,
+    # l_shape -1.44). Fill them in from extract.json width_off of good extracts.
+    width_off_mm: {hexagon: -0.21}
+    width_tol_mm: 0.5
+    slip_tol_mm: 0.3
+    put_back: true
+    put_back_hover_mm: 40.0
+    put_back_above_seat_mm: 1.0
+    put_back_max_short_mm: 8.0
+    put_back_force_change_n: 15.0
   grasp_force_n: 45.0
   grasp_eps_inner_mm: 3.0    # accepted narrower than the seat width (pegs sit deeper in the printed V: `grasp`)
   grasp_eps_outer_mm: 1.0
   # Empty: both rectangle and L match the normal (unmirrored) CAD seat in insert and extract (2026-11-24).
   mirrored_shapes: []
-  options: [--max-tip-speed, "0.12"]  # allow brief stick-slip breakaway (>50 mm/s) on 0.03 mm holes without aborting
+  options: [--max-tip-speed, "0.12", --max-rot-speed, "0.45"]  # allow brief stick-slip breakaway and descent roll adjustments without aborting
 
 # pipeline campaign (board_pipeline/campaign.py): full-board rounds, unattended. Each peg starts in its
 # start_clearance hole; each round goes row-wise through `clearances` across all shapes (extract, insert); a peg that
@@ -386,6 +473,9 @@ extract:
 # next clearance. XY hole corrections (`found_holes.yaml`) are kept within a round and archived/reset between rounds.
 campaign:
   rounds: 20
+  # After each completed board (round): the empty hand up rehome_lift_m (over the seated pegs), gripper homing.
+  rehome_gripper_each_round: true
+  rehome_lift_m: 0.06
   shapes: [round, hexagon, triangle, rectangle, l_shape]
   clearances: [c3mm, c1mm, c0p2mm]
   start_clearance: c0p2mm
@@ -395,3 +485,7 @@ campaign:
   on_extract_failure: stop
   # Holes inserted with --no-board-correction during campaigns (e.g. temporary workaround).
   no_board_correction_holes: [l_shape_c3mm]
+  # Holes the campaign never inserts into (logged as skipped; the peg stays where it is). 2026-11-25: triangle_c0p2mm
+  # missed 4 of 5 episodes, each miss 5 tilt searches scraping the acrylic around it, now grooved.
+  # 21:17: corner-in trial 2 inserted it (insert.hole_overrides); back in the campaign with that override.
+  skip_holes: []

@@ -21,6 +21,7 @@ inserting only. Everything goes to sessions/<name>/extract/<date>_<time>/.
 
 from __future__ import annotations
 
+import csv
 import datetime
 import json
 import math
@@ -63,6 +64,16 @@ def equivalent_rotation(r_peg: np.ndarray, r_ref: np.ndarray, period: float) -> 
         if angle < best_angle:
             best, best_angle = cand, angle
     return best
+
+
+def upright_rotation(r_peg: np.ndarray, r_ref: np.ndarray, period: float) -> np.ndarray:
+    """Level r_peg to the upright board normal from r_ref, keeping only the in-plane yaw offset modulo `period`
+    (period <= 0: return r_ref directly). Strips roll/pitch tilt left by tilt-slide inserts."""
+    if period <= 0.0:
+        return np.array(r_ref, float, copy=True)
+    rel = r_ref.T @ r_peg
+    dyaw = math.remainder(math.atan2(rel[1, 0], rel[0, 0]), period)
+    return r_ref @ _rz(dyaw)
 
 
 def pose_from_record(record: dict) -> np.ndarray:
@@ -109,6 +120,103 @@ def _vision_board(session, data: dict, dq) -> np.ndarray:
     return board
 
 
+def grasp_problem(result: dict, shape: str, gate: dict | None) -> str | None:
+    """Why a held extract's grasp is not trusted (None: it is). Robot 2026-11-25: a finger landed on the hexagon's top
+    in hexagon_c3mm, the roof "touched" 18 mm high (-3.7 mm from the board, every good extract -20.7..-22.9) and the hand
+    closed on the top 4 mm (width -2.95 mm from the seat, inside grasp_eps_inner); the next insert went false-positive
+    and the peg fell over. And an L slipped ~16 mm in the fingers while its pull from the 0.2 mm hole stalled (width
+    -2.44 mm, its normal -1.44). gate: extract.grasp_gate."""
+    if not gate:
+        return None
+    problems = []
+    contact = result.get("contact_above_board")
+    if contact is not None and gate.get("contact_mm") is not None:
+        off = float(contact) * 1e3 - float(gate["contact_mm"])
+        if abs(off) > float(gate.get("contact_tol_mm", 3.0)):
+            problems.append(f"the roof touched {float(contact) * 1e3:+.1f} mm from the board ({off:+.1f} mm from the "
+                            f"pocket's {float(gate['contact_mm']):+.1f}; a finger on the peg top?)")
+    normal = (gate.get("width_off_mm") or {}).get(shape)
+    width_off = result.get("width_off")
+    if normal is not None and width_off is not None:
+        off = float(width_off) * 1e3 - float(normal)
+        if abs(off) > float(gate.get("width_tol_mm", 0.5)):
+            problems.append(f"the hand is {float(width_off) * 1e3:+.2f} mm from the seat width, {off:+.2f} mm from the "
+                            f"{shape}'s normal {float(normal):+.2f} (held on another part of the peg)")
+    seated_w, width = result.get("grasp_width_seated"), result.get("width")
+    if seated_w is not None and width is not None and gate.get("slip_tol_mm") is not None:
+        change = (float(width) - float(seated_w)) * 1e3
+        if abs(change) > float(gate["slip_tol_mm"]):
+            problems.append(f"the hand's width changed {change:+.2f} mm between the grasp and the end of the pull "
+                            f"({result.get('pull_stalls', 0)} pull stall(s)): the peg slipped in the fingers")
+    return "; ".join(problems) or None
+
+
+def _last_tip_z(csv_path: Path) -> float | None:
+    """The tip z of a peg_search log's last row (p_z), None if there is none."""
+    try:
+        with open(csv_path) as f:
+            rows = list(csv.reader(f))
+        col = rows[0].index("p_z")
+        return float(rows[-1][col]) if len(rows) > 1 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def put_back(cfg, s: dict, out: Path, result: dict, tool, dq, gate: dict, k: int, open_width_mm: float,
+             retry_z: float, travel_z: float | None) -> str:
+    """The peg held but not trusted (grasp_problem), out of its hole above it. Its tip (this grasp's model: right
+    whatever part the fingers hold) back over where it sat (the pull and the lift leave it up to ~8 mm off: the pull
+    axis, the soft pull stiffness), the peg upright, gate.put_back_hover_mm over the seat; then straight down until the
+    tip is gate.put_back_above_seat_mm over the seat, in legs of at most 45 mm, gentle force-change stop. Stopped higher
+    than gate.put_back_max_short_mm over the seat: not in the hole, the hand keeps the peg and goes back up ("hand").
+    Else open, up to retry_z ("hole"); "unknown" if the open or that lift failed."""
+    seated = result.get("seated_tip")
+    z = (result.get("end_tip") or [None] * 3)[2]
+    if not seated or z is None:
+        print("put back: no seated tip or end tip in the result; the hand keeps the peg")
+        return "hand"
+    seat_z = float(seated[2])
+    target = seat_z + float(gate.get("put_back_above_seat_mm", 1.0)) / 1000.0
+    max_short = float(gate.get("put_back_max_short_mm", 8.0)) / 1000.0
+    gentle = {**s, "lift_max_force_change": float(gate.get("put_back_force_change_n", 15.0))}
+    over = max(min(float(z), seat_z + float(gate.get("put_back_hover_mm", 40.0)) / 1000.0), float(z) - 0.045)
+    print(f"\n== put back: the peg upright over its seat ({float(seated[0]) * 1e3:.2f}, {float(seated[1]) * 1e3:.2f}) "
+          f"mm, tip {float(z) * 1e3:.1f} -> {over * 1e3:.1f} -> {target * 1e3:.1f} mm (seated {seat_z * 1e3:.1f}) ==",
+          flush=True)
+    if not insert.lift(cfg, s, out, 0.0, f"put_back_{k}_over", tool=tool, dq=dq, to_z=over,
+                       to_xy=seated[:2], upright=True):
+        print("put back: the move over the seat failed; the hand keeps the peg")
+        return "hand"
+    z = _last_tip_z(out / f"put_back_{k}_over.csv") or over
+    leg = 0
+    while z > target + 0.0003:
+        leg += 1
+        step = max(target, z - 0.045)
+        name = f"put_back_{k}_{leg}"
+        ok = insert.lift(cfg, gentle, out, 0.0, name, tool=tool, dq=dq, to_z=step)
+        reached = _last_tip_z(out / f"{name}.csv")
+        z = reached if reached is not None else z
+        if not ok:
+            print(f"put back: stopped at tip {z * 1e3:.1f} mm ({(z - seat_z) * 1e3:+.1f} mm over the seat)")
+            break
+        if leg > 6:
+            break
+    if z - seat_z > max_short:
+        print(f"put back: {(z - seat_z) * 1e3:.1f} mm over the seat (> {max_short * 1e3:g}): not in the hole; "
+              "the hand keeps the peg and goes back up")
+        if travel_z is not None:
+            insert.lift(cfg, s, out, 0.0, f"put_back_{k}_up", tool=tool, dq=dq, to_z=travel_z)
+        return "hand"
+    if not insert.open_hand(cfg, s, out, open_width_mm):
+        print("put back: the hand did not open")
+        return "unknown"
+    up = max(z + 0.005, retry_z)
+    print(f"put back: in the hole; hand open, up to tip z {up * 1e3:.1f} mm")
+    if not insert.lift(cfg, s, out, 0.0, f"put_back_{k}_clear", tool=tool, dq=dq, to_z=up):
+        return "unknown"
+    return "hole"
+
+
 def run(session, args, probe_target, record: dict | None = None, here: bool = False,
         restart_launch: bool = True) -> dict:
     """Pull the peg out of args.hole. record: insert's release record of that hole (else the vision hole). here: the
@@ -116,6 +224,7 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
     "hole", "unknown"), "out", "result", "error"}."""
     cfg = session.cfg
     s, e = insert.settings(cfg), settings(cfg)
+    gate = e.get("grasp_gate") or {}
     holes = load_yaml(cfg.path(cfg["holes"]))["holes"]
     if args.hole not in holes:
         raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
@@ -146,11 +255,14 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
     if record is not None:
         pose = pose_from_record(record)
         if not here:
-            # The same grasp, turned by the peg's symmetry to the wrist the approach chose. Only the record's tip
-            # geometry (insert's tool) puts the hand where it was.
+            # The same grasp, turned by the peg's symmetry to the wrist the approach chose (levelled upright by
+            # default so tilt-insert lean does not drag tight extracts into the wall).
             period = record.get("period_rad")
             period = float(period) if period is not None else float(grasp.hole_tool(cfg, holes[args.hole], args.hole).period)
-            pose[:3, :3] = equivalent_rotation(pose[:3, :3], r_approach, period)
+            if e.get("upright_from_record", True):
+                pose[:3, :3] = upright_rotation(pose[:3, :3], r_approach, period)
+            else:
+                pose[:3, :3] = equivalent_rotation(pose[:3, :3], r_approach, period)
             tool = SimpleNamespace(tip_offset=np.asarray(record["tip_offset_tcp_m"], float),
                                    grasp_width_mm=grasp_width)
         board_z = float(record["board_z_m"])
@@ -166,8 +278,20 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
         top_guess = board_z
         where = "the vision hole" + (" (the mirrored CAD seat)" if mirror else "")
     hover_z = top_guess + float(e["hover_mm"]) / 1000.0
+    if e.get("min_hover_above_board_mm") is not None:
+        hover_z = max(hover_z, board_z + float(e["min_hover_above_board_mm"]) / 1000.0)
     min_z = board_z - float(e["max_depth_mm"]) / 1000.0
-    open_width = grasp_width + 2.0 * float(e["open_margin_mm"])
+    clearance_tool = tool if all(hasattr(tool, a) for a in ("point", "rotation", "tip_offset")) else \
+        grasp.hole_tool(cfg, holes[args.hole], args.hole)
+    neighbor_clear_mm = e.get("neighbor_clearance_mm", 2.5)
+    min_open_width = grasp_width + 2.0 * float(e.get("min_open_margin_mm", 1.5))
+    req_open_width = grasp_width + 2.0 * float(e["open_margin_mm"])
+    open_width, capped_by, clear_mm = grasp.safe_open_width_mm(
+        clearance_tool, holes, args.hole, req_open_width,
+        min_clearance_mm=neighbor_clear_mm, min_width_mm=min_open_width)
+    if capped_by is not None and open_width < req_open_width - 0.05:
+        print(f"neighbor clearance cap: open width {req_open_width:.1f} -> {open_width:.1f} mm "
+              f"({clear_mm:.1f} mm clear of {capped_by})")
     print(f"\nextract {args.hole} ({shape}): the peg at {where}, ({pose[0, 3] * 1e3:.2f}, {pose[1, 3] * 1e3:.2f}) mm; "
           f"board {board_z * 1e3:.2f} mm; descent from {hover_z * 1e3:.2f} to at most {min_z * 1e3:.2f} mm; fingers "
           f"{open_width:.1f} mm open, grasp {grasp_width:.2f} mm")
@@ -262,19 +386,52 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
             insert.stop_launch(cfg, s)
         tries = 1 + int(e.get("retries", 3))
         attempt_open_width = open_width
-        max_open_width = grasp_width + 2.0 * max(10.0, float(e["open_margin_mm"]))
+        req_max_open = grasp_width + 2.0 * max(float(e["open_margin_mm"]),
+                                               float(e.get("retry_max_open_margin_mm", e["open_margin_mm"])))
+        max_open_width, _, _ = grasp.safe_open_width_mm(
+            clearance_tool, holes, args.hole, req_max_open,
+            min_clearance_mm=neighbor_clear_mm, min_width_mm=open_width)
         outcome["attempts"] = 0
+        prev_fail = None
         for k in range(1, tries + 1):
             name = "extract" if k == 1 else f"extract_{k}"
             print(f"\n== extract{f' (retry {k - 1}/{tries - 1})' if k > 1 else ''}: roof onto the peg, grasp, pull ==",
                   flush=True)
             outcome["attempts"] = k
-            code = insert.peg_search(cfg, s, out, argv if k == 1 else extract_argv(pose, name, attempt_open_width))
+            open_width_used = attempt_open_width
+            code = insert.peg_search(cfg, s, out, argv if k == 1 else extract_argv(pose, name, open_width_used))
             result_file = out / f"{name}.json"
             result = json.loads(result_file.read_text()) if result_file.exists() else \
                 {"ok": False, "stage": "unknown", "error": f"peg_search exited {code} without a result"}
             outcome["result"] = result
             stage = result.get("stage")
+            problem = grasp_problem(result, shape, gate) if code == 0 and result.get("ok") and result.get("held") \
+                else None
+            if problem:
+                print(f"\nextract: the peg is held, but the grasp is not trusted: {problem}", flush=True)
+                outcome.update(ok=False, peg="hand", error=f"grasp not trusted: {problem}")
+                outcome.setdefault("untrusted", []).append(problem)
+                if not gate.get("put_back", True):
+                    break
+                retry = k < tries
+                release_mm = min(float(s["release_width_mm"]),
+                                 grasp_width + float(s.get("release_margin_mm") or s["release_width_mm"]))
+                where = put_back(cfg, s, out, result, tool, dq, gate, k, release_mm,
+                                 hover_z + float(e.get("retry_above_hover_mm", 5.0)) / 1000.0,
+                                 vision_z + peg_travel if peg_travel is not None else None)
+                outcome["peg"] = where
+                if where == "hole":
+                    outcome["error"] = f"grasp not trusted, the peg put back in its hole: {problem}"
+                if where != "hole" or not retry:
+                    break
+                seated = result["seated_tip"]
+                pose = pose.copy()
+                pose[0, 3], pose[1, 3] = float(seated[0]), float(seated[1])
+                print(f"retry aims where the fingers seated on the peg: ({seated[0] * 1e3:.2f}, {seated[1] * 1e3:.2f}) mm")
+                if float(result.get("contact_above_board", -1.0)) > -0.008:
+                    attempt_open_width = min(max_open_width, attempt_open_width + 6.0)
+                    print(f"high contact: retry widens the open width to {attempt_open_width:.1f} mm")
+                continue
             if code == 0 and result.get("ok") and result.get("held"):
                 outcome.update(ok=True, peg="hand", error=None)
                 print(f"\nextracted{f' on retry {k - 1}' if k > 1 else ''}: the roof touched the peg "
@@ -289,10 +446,21 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
                 # Out of the hole (the lift failed, or the hand lost the peg after the pull), or it never started.
                 outcome["peg"] = "unknown" if stage in ("lift", "done", "unknown") else "hole"
                 break
+            contact_above = result.get("contact_above_board")
+            if contact_above is None and result.get("contact_tip_z") is not None:
+                contact_above = float(result["contact_tip_z"]) - board_z
             # The peg in its hole (or never touched): let go of it, if held, and get the hand clear: just over the
             # hover for a retry (the next attempt starts there), insert.lift_m after the last.
             retry = k < tries and stage not in ("options", "connect")
-            opened = insert.open_hand(cfg, s, out)
+            tol_m = float(e.get("same_failure_contact_tol_mm", 1.0)) / 1000.0
+            if (retry and stage in STAGES_IN_HOLE and prev_fail is not None and stage == prev_fail[0]
+                    and contact_above is not None and prev_fail[1] is not None
+                    and abs(float(contact_above) - float(prev_fail[1])) <= tol_m
+                    and open_width_used <= prev_fail[2] + 1e-6):
+                print("same failure repeated at the same contact height: stopping retries", flush=True)
+                retry = False
+            prev_fail = (stage, float(contact_above) if contact_above is not None else None, open_width_used)
+            opened = insert.open_hand(cfg, s, out, open_width_used)  # no wider than the attempt: neighbours
             end_z = (result.get("end_tip") or [None, None, None])[2]
             if retry and opened and end_z is not None:
                 to_z = max(float(end_z) + 0.005, hover_z + float(e.get("retry_above_hover_mm", 5.0)) / 1000.0)
@@ -319,9 +487,6 @@ def run(session, args, probe_target, record: dict | None = None, here: bool = Fa
                       f"({(seated[0] - pose[0, 3]) * 1e3:+.2f}, {(seated[1] - pose[1, 3]) * 1e3:+.2f}) mm from before")
                 pose = pose.copy()
                 pose[0, 3], pose[1, 3] = float(seated[0]), float(seated[1])
-            contact_above = result.get("contact_above_board")
-            if contact_above is None and result.get("contact_tip_z") is not None:
-                contact_above = float(result["contact_tip_z"]) - board_z
             if stage == "grasp" and contact_above is not None and float(contact_above) > -0.008:
                 wider = min(max_open_width, attempt_open_width + 6.0)
                 print(f"high contact ({float(contact_above) * 1e3:+.1f} mm from board): finger tip likely hit the peg top")
@@ -353,7 +518,7 @@ def cmd_extract(session, args, probe_target) -> None:
     outcome = run(session, args, probe_target, record=record, here=args.here)
     if not outcome["ok"]:
         raise PipelineError(f"{args.hole}: not extracted ({outcome['error']}); the peg is "
-                            f"{'in the hole' if outcome['peg'] == 'hole' else 'somewhere unknown'}; "
+                            f"{ {'hole': 'in the hole', 'hand': 'in the hand'}.get(outcome['peg'], 'somewhere unknown')}; "
                             f"results in {outcome['out']}")
     if not args.dry_run:
         from board_pipeline import campaign

@@ -201,7 +201,8 @@ def _insert_args(args, hole: str, park: bool = False, no_board_correction_holes=
                            touches=None,
                            no_board_correction=bool(getattr(args, "no_board_correction", False)
                                                     or hole in (no_board_correction_holes or ())),
-                           no_centre=park, no_record=park, here=False, dry_run=False)
+                           no_centre=park, no_record=park, here=False, dry_run=False,
+                           corner_in=getattr(args, "corner_in", None))
 
 
 def _extract_args(hole: str) -> SimpleNamespace:
@@ -238,7 +239,7 @@ def _advance(state: dict) -> None:
             state["step"], state["round"] = 0, state["round"] + 1
 
 
-def _advance_and_save(session, state: dict) -> None:
+def _advance_and_save(session, state: dict, rehome: bool = False) -> None:
     prev_round = state["round"]
     _advance(state)
     if state["round"] > prev_round:
@@ -248,10 +249,43 @@ def _advance_and_save(session, state: dict) -> None:
             print(f"campaign: archived round {prev_round} found_holes to {archived.name}; "
                   f"reset for round {state['round']}")
     save_state(session, state)
+    if rehome and state["round"] > prev_round:
+        rehome_gripper(session, state, prev_round)
+
+
+def rehome_gripper(session, state: dict, finished_round: int) -> None:
+    """After each completed board (campaign.rehome_gripper_each_round): the empty hand up campaign.rehome_lift_m, then
+    the gripper's homing (fingers to their limits: width calibration, a stuck finger shows). Not with a peg in the hand
+    (homing opens it). Logs in campaign/rehome/. A failed lift or homing stops the campaign (the hand empty; the state
+    already in the next round)."""
+    c = settings(session.cfg)
+    if not c.get("rehome_gripper_each_round", True):
+        return
+    held = [shape for shape, peg in state["pegs"].items() if peg["at"] == "hand"]
+    if held:
+        print(f"\ncampaign: no gripper homing after round {finished_round}: the hand holds the {held[0]} peg")
+        return
+    cfg, s = session.cfg, insert.settings(session.cfg)
+    out = _dir(session) / "rehome" / f"round_{finished_round}_{datetime.datetime.now():%Y-%m-%d_%H%M%S}"
+    out.mkdir(parents=True, exist_ok=True)
+    lift_m = float(c.get("rehome_lift_m", 0.06))
+    print(f"\n== campaign: board {finished_round} done: the empty hand up {lift_m * 1e3:g} mm, gripper homing ==",
+          flush=True)
+    if lift_m > 0.0 and not insert.lift(cfg, s, out, lift_m, "rehome_lift"):
+        raise PipelineError(f"the lift before the gripper homing after round {finished_round} failed (the hand is "
+                            f"empty; logs in {out}); `pipeline campaign run` goes on with round {state['round']}")
+    if insert.robot_program(cfg, s, out, "gripper", [s["robot_ip"], "home"]) != 0:
+        raise PipelineError(f"the gripper homing after round {finished_round} failed (the hand is empty); check the "
+                            f"gripper, then `pipeline campaign run` goes on with round {state['round']}")
+    after = insert.gripper_state(cfg, s)
+    width = f" (width {after['width'] * 1e3:.1f} mm)" if after else ""
+    print(f"campaign: gripper homed{width}")
 
 
 def _attempts(summary: dict) -> int:
-    return len((summary or {}).get("attempts") or [])
+    """Insertion attempts: the plunge and each tilt search; board touches alone (method "touch", tight holes without
+    a plunge) are not one."""
+    return sum(1 for a in (summary or {}).get("attempts") or [] if a.get("method") != "touch")
 
 
 def _insert(session, args, probe_target, state, shape, hole, role) -> dict:
@@ -307,7 +341,7 @@ def _extract(session, args, probe_target, state, shape) -> dict:
     outcome = extract.run(session, _extract_args(hole), probe_target, record=record, here=here,
                           restart_launch=not libfranka_travel)
     state["over"] = None
-    if outcome["ok"]:
+    if outcome["ok"] or outcome["peg"] == "hand":  # not ok and in the hand: held, the grasp not trusted
         state["pegs"][shape] = {"at": "hand", "record": None}
     elif outcome["peg"] != "hole":
         state["pegs"][shape] = {"at": "unknown", "record": None}
@@ -371,12 +405,20 @@ def cmd_run(session, args, probe_target) -> None:
                 shape = state["shapes"][state["shape_index"]]
                 hole = f"{shape}_{state['clearances'][state['step']]}"
                 holding = [sh for sh, peg in state["pegs"].items() if peg["at"] == "hand"]
+                if hole in (c.get("skip_holes") or ()):
+                    print(f"\ncampaign: {hole} skipped (campaign.skip_holes); the {shape} peg stays in "
+                          f"{state['pegs'][shape]['at']}")
+                    log_result(session, {"time": datetime.datetime.now().isoformat(timespec="seconds"),
+                                         "round": state["round"], "shape": shape, "hole": hole, "role": "skipped",
+                                         "ok": 0, "note": "campaign.skip_holes"})
+                    _advance_and_save(session, state, rehome=True)
+                    continue
                 if shape in state["blocked"]:
                     print(f"\ncampaign: {hole} skipped: the {shape} peg is blocked ({state['blocked'][shape]})")
                     log_result(session, {"time": datetime.datetime.now().isoformat(timespec="seconds"),
                                          "round": state["round"], "shape": shape, "hole": hole, "role": "skipped",
                                          "ok": 0, "note": state["blocked"][shape]})
-                    _advance_and_save(session, state)
+                    _advance_and_save(session, state, rehome=True)
                     continue
                 if holding and holding != [shape]:
                     raise PipelineError(f"the hand holds the {holding[0]} peg, the next hole is {hole}: put it back "
@@ -386,7 +428,10 @@ def cmd_run(session, args, probe_target) -> None:
                     out = _extract(session, args, probe_target, state, shape)
                     if not out["ok"]:
                         if out["peg"] != "hole" or c.get("on_extract_failure", "stop") == "stop":
-                            raise PipelineError(f"extracting the {shape} peg failed ({out['error']}); results in {out['out']}")
+                            where = {"hand": "it is in the hand", "hole": f"it is in {state['pegs'][shape]['at']}"}.get(
+                                out["peg"], "where it is is unknown")
+                            raise PipelineError(f"extracting the {shape} peg failed ({out['error']}); {where}; "
+                                                f"results in {out['out']}")
                         state["blocked"][shape] = f"not extracted from {state['pegs'][shape]['at']}: {out['error']}"
                         save_state(session, state)
                         print(f"\ncampaign: the {shape} peg stays in {state['pegs'][shape]['at']}; its shape is skipped "
@@ -404,7 +449,7 @@ def cmd_run(session, args, probe_target) -> None:
                     if state["pegs"][shape]["at"] != park:
                         raise PipelineError(f"parking the {shape} peg in {park} failed ({out['stopped'] or 'not inserted'}); "
                                             f"it is {'in the hand' if state['pegs'][shape]['at'] == 'hand' else 'somewhere unknown'}")
-                _advance_and_save(session, state)
+                _advance_and_save(session, state, rehome=True)
         print(f"\ncampaign: all {state['rounds']} rounds done; `pipeline campaign status` sums them up")
     finally:
         insert.start_launch(session.cfg, insert.settings(session.cfg))

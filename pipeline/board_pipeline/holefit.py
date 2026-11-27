@@ -157,10 +157,11 @@ def fit_centre(tips_xy, free_hole: np.ndarray, yaw_base: float, guess_xy, search
 
 
 def found_from_touches(result: dict, free_hole, yaw_base: float, guess_xy, min_contacts: int = 4,
-                       max_rms: float = 1.0e-4, floor: float = 1.0e-4, max_delta: float = 2.0e-4) -> dict | None:
-    """The hole from a `peg_search centre` result, or None (too few contacts, all on one side, or they do not fit
-    the outline within max_rms, or only with it moved more than max_delta). At least 4 contacts: with the offset
-    the fit has 3 unknowns."""
+                       max_rms: float = 1.0e-4, floor: float = 1.0e-4, max_delta: float = 2.0e-4,
+                       min_minor_frac: float = 0.055) -> dict | None:
+    """The hole from a `peg_search centre` result, or None (too few contacts, all on one side, nearly collinear
+    cluster, start outside the fitted free region, or they do not fit the outline within max_rms, or only with it moved
+    more than max_delta). At least 4 contacts: with the offset the fit has 3 unknowns."""
     touches = [t for t in result.get("touches") or [] if t.get("contact")]
     if not result.get("ok") or len(touches) < min_contacts:
         return None
@@ -168,9 +169,22 @@ def found_from_touches(result: dict, free_hole, yaw_base: float, guess_xy, min_c
     gaps = np.diff(angles + [angles[0] + 2.0 * math.pi])
     if np.max(gaps) >= math.pi:  # the contacts all on one side: the centre is not pinned
         return None
-    fit = fit_centre([t["tip"] for t in touches], free_hole, yaw_base, guess_xy, max_delta=max_delta)
+    tips = np.asarray([t["tip"][:2] for t in touches], float)
+    free_diam = diameter(free_hole)
+    if len(tips) >= 3 and free_diam > 0.0:
+        evals = np.linalg.eigvalsh(np.cov(tips.T))
+        minor = math.sqrt(max(float(evals[0]), 0.0))
+        if minor < float(min_minor_frac) * free_diam:
+            return None
+    fit = fit_centre(tips, free_hole, yaw_base, guess_xy, max_delta=max_delta)
     if fit["rms_m"] > max_rms:
         return None
+    centre = np.asarray(fit["xy"], float)
+    start_tip = result.get("start_tip")
+    if start_tip is not None and len(start_tip) >= 2:
+        free_base = to_base(free_hole, yaw_base)
+        if float(signed_distance(free_base, np.asarray(start_tip[:2], float) - centre)) > max_delta + 2.0e-4:
+            return None
     return {"xy": fit["xy"], "sigma_m": max(floor, fit["rms_m"]), "source": f"wall touches ({len(touches)})",
             "rms_m": fit["rms_m"], "delta_m": fit["delta_m"]}
 
@@ -194,14 +208,18 @@ def load_found(session_path: Path) -> list[dict]:
 
 
 def record_found(session_path: Path, hole: str, vision_xy, found: dict, board_sha256: str, run: str,
-                 arm_angle_deg: float = 0.0) -> dict:
-    """arm_angle_deg: the elbow the hole was found at (grasp.choose_turn's elbow fallback); written when not 0."""
+                 arm_angle_deg: float = 0.0, tip_offset=None) -> dict:
+    """arm_angle_deg: the elbow the hole was found at (grasp.choose_turn's elbow fallback); written when not 0.
+    tip_offset: TCP -> peg tip vector (m, TCP axes) used during the run; written when given so same-hole elbow
+    corrections never mix runs taken with different tip calibrations."""
     entry = {"hole": hole, "vision_xy": [float(v) for v in np.asarray(vision_xy, float)[:2]],
              "found_xy": [float(v) for v in found["xy"]], "sigma_m": float(found["sigma_m"]),
              "source": found["source"], "board_sha256": board_sha256, "run": run,
              "time": datetime.datetime.now().isoformat(timespec="seconds")}
     if arm_angle_deg:
         entry["arm_angle_deg"] = float(arm_angle_deg)
+    if tip_offset is not None:
+        entry["tip_in_tcp_m"] = [round(float(v), 6) for v in np.asarray(tip_offset, float)[:3]]
     entries = load_found(session_path) + [entry]
     path = found_path(session_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +231,8 @@ def record_found(session_path: Path, hole: str, vision_xy, found: dict, board_sh
 
 # ---------------------------------------------------------------- the correction
 def fit_correction(entries: list[dict], board_sha256: str | None, prior_shift_m: float = 0.003,
-                   prior_turn_deg: float = 0.3, outlier_sigmas: float = 3.0, outlier_floor_m: float = 0.0005) -> dict | None:
+                   prior_turn_deg: float = 0.3, outlier_sigmas: float = 3.0, outlier_floor_m: float = 0.0005,
+                   max_turn_deg: float = 1.0) -> dict | None:
     """The board's rigid shift in the base plane from the found holes of this board pose (None: none).
 
     Linear in (tx, ty, theta) for small turns about the holes' weighted centre c:
@@ -249,12 +268,26 @@ def fit_correction(entries: list[dict], board_sha256: str | None, prior_shift_m:
             use = use[:worst] + use[worst + 1:]
             continue
         break
+    turn_clamped = False
+    if max_turn_deg is not None and abs(math.degrees(float(p[2]))) > float(max_turn_deg):
+        A2 = A[:, :2]
+        N2 = A2.T @ (W[:, None] * A2) + P[:2, :2]
+        cov2 = np.linalg.inv(N2)
+        p2 = cov2 @ (A2.T @ (W * b))
+        p = np.array([p2[0], p2[1], 0.0])
+        cov = np.zeros((3, 3))
+        cov[:2, :2] = cov2
+        cov[2, 2] = math.radians(prior_turn_deg) ** 2
+        res = (b - A @ p).reshape(-1, 2)
+        err = np.linalg.norm(res, axis=1)
+        turn_clamped = True
     return {"shift_m": [float(p[0]), float(p[1])], "turn_deg": math.degrees(float(p[2])),
             "centre_m": [float(c[0]), float(c[1])], "holes": len(use),
             "sigma_shift_m": float(math.sqrt(max(cov[0, 0], cov[1, 1]))),
             "sigma_turn_deg": math.degrees(math.sqrt(cov[2, 2])),
             "residuals_m": {e["hole"] + "@" + str(e.get("run", "")): float(r) for e, r in zip(use, err)},
             "dropped": [{"hole": d["hole"], "run": d.get("run"), "residual_m": d["residual_m"]} for d in dropped],
+            "turn_clamped": turn_clamped,
             "board_sha256": board_sha256}
 
 
@@ -385,6 +418,41 @@ def full_matrix(corr: dict) -> np.ndarray:
 
 def correct_xy_full(xy, corr: dict) -> np.ndarray:
     return correct_xy(xy, corr) + np.asarray(corr.get("local_m", [0.0, 0.0]), float)
+
+
+def same_hole_elbow_correction(entries: list[dict], hole: str, board_sha256: str | None, arm_angle_deg: float,
+                               tip_offset=None, angle_tol_deg: float = 1.0, tip_tol_m: float = 2.0e-4,
+                               prior_shift_m: float = 0.003) -> dict | None:
+    """Direct XY correction for a hole inserted with the elbow turned (arm_angle_deg != 0), fitted only to prior
+    runs of that same hole, board pose, elbow arm angle (within angle_tol_deg) and tip offset (within tip_tol_m).
+    Returns a correction dict compatible with full_matrix / correct_xy_full, or None when no matching runs exist."""
+    tip = np.asarray(tip_offset, float)[:2] if tip_offset is not None else None
+    use = []
+    for e in entries:
+        if e.get("hole") != hole:
+            continue
+        if board_sha256 is not None and e.get("board_sha256") != board_sha256:
+            continue
+        if abs(float(e.get("arm_angle_deg") or 0.0) - float(arm_angle_deg)) > angle_tol_deg:
+            continue
+        if tip is not None:
+            e_tip = e.get("tip_in_tcp_m")
+            if e_tip is None or float(np.linalg.norm(np.asarray(e_tip, float)[:2] - tip)) > tip_tol_m:
+                continue
+        use.append(e)
+    if not use:
+        return None
+    v = np.array([e["vision_xy"] for e in use], float)
+    f = np.array([e["found_xy"] for e in use], float)
+    w = 1.0 / np.square(np.array([e["sigma_m"] for e in use], float))
+    prec = float(np.sum(w)) + 1.0 / (prior_shift_m ** 2)
+    shift = np.sum(w[:, None] * (f - v), axis=0) / prec
+    sigma = math.sqrt(1.0 / prec)
+    centre = np.mean(v, axis=0)
+    return {"holes": len(use), "centre_m": [float(centre[0]), float(centre[1])],
+            "shift_m": [float(shift[0]), float(shift[1])], "sigma_shift_m": float(sigma),
+            "turn_deg": 0.0, "sigma_turn_deg": 0.0, "local_m": [0.0, 0.0], "local_sigma_m": 0.0,
+            "dropped": [], "elbow_same_hole": True, "arm_angle_deg": float(arm_angle_deg)}
 
 
 def leave_one_out(entries: list[dict], board_sha256: str | None, **local) -> dict | None:

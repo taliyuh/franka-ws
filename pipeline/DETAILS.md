@@ -300,18 +300,18 @@ distance from the target in board axes (`x`/`y` beside it, height above it).
 second until Ctrl-C, also while you guide the arm by hand.
 
 **The held peg.** The gripper carries the printed V-block fingers
-(franka_fr3_fingers v2: finger A, the V-block, on `panda_leftfinger`), which hold
+(franka_fr3_fingers v3: finger A, the V-block, on `panda_leftfinger`), which hold
 every peg off the TCP axis. The peg is assumed to be the one of the hole's
 shape, seated in the V with its top against the roof (gripper width as in
 `config/grasps.yaml`). Where each peg sits relative to `panda_hand_tcp`:
 
 | peg       | peg axis from the TCP (hand x, y) | tip below the TCP | turns allowed |
 |-----------|-----------------------------------|-------------------|---------------|
-| round     | 0, +16.5 mm                       | 39 mm             | any           |
-| hexagon   | 0, +15.2 mm                       | 39 mm             | 60°           |
-| triangle  | 0, +17.0 mm                       | 39 mm             | 120°          |
-| rectangle | +0.5, +15.5 mm                    | 39 mm             | 180°          |
-| L         | +4.5, +17.0 mm                    | 39 mm             | none          |
+| round     | 0, +12.0 mm                       | 39 mm             | any           |
+| hexagon   | 0, +10.8 mm                       | 39 mm             | 60°           |
+| triangle  | 0, +12.5 mm                       | 39 mm             | 120°          |
+| rectangle | +0.5, +11.0 mm                    | 39 mm             | 180°          |
+| L         | +4.5, +12.5 mm                    | 39 mm             | none          |
 
 The peg frame is lined up with the hole frame, turned about the peg axis by
 one of the allowed turns: they all fit the hole, but each puts the wrist
@@ -327,7 +327,7 @@ choice (it warns when joint 7 gets close to its limit). The resulting tool
 (TCP orientation and TCP-to-peg-tip vector) is
 written to `targets/<hole>_tool.yaml` and replaces the pen settings of
 `board_manipulation.yaml` for that hole. The offsets are nominal CAD values
-from `grasp_poses_v2.json`, registered onto the hole-frame convention by
+from `config/grasp_poses_v3.json`, registered onto the hole-frame convention by
 `tools/extract_grasps.py` (run it in the rl_manip checkout, like
 `extract_holes.py`).
 
@@ -432,8 +432,17 @@ up, next point) or the tip 15 mm below the board (inserted, then step 5). `inser
      dip region (the lead positions from the hole centre where it dips: `near_m`, `band_m`, `along_m`,
      `eff_band_m`, the band whose lines run at least 1 mm inside the region). Of the leads, the fewest
      lines, then the simulation's group order, then the slide nearest base +y
-     (`insert.slide_dir_base_deg`: tilting about base y vibrated the wrist); the round peg
-     slides along it exactly. The 3 mm rectangle hole is not in the simulation: it uses the 1 mm's.
+     (`insert.slide_dir_base_deg`: tilting about base y vibrated the wrist). The round peg slides
+     in a random direction each insert (`insert.round_slide_random`, 2026-11-27: not along the same
+     path of the board every time), kept only if the tilted hand reaches both ends of the outer lines
+     with every joint `round_slide_joint_margin_rad` inside its limits; `--slide-dir` fixes it.
+     The 3 mm rectangle hole is not in the simulation: it uses the 1 mm's.
+   * Corner-in (`insert.corner_in`, `--corner-in auto|on|off`, 2026-11-27): the lead (a corner; the
+     hexagon's flat edge) starts inside the hole's near rim (`--start-in-hole`; 0.55 x `near_m` in
+     2.5..4.5 mm, never past `near_m + along_m[0]`, where it dips) instead of sliding onto the hole
+     across the board. Default: every shape but round, every clearance, found holes or not; at most
+     0.2 mm two attempts (`corner_in_attempts`). Needs lines and the touches' board plane (else the
+     normal slide).
    * The first run that searches probes the board (4 points 25 mm about the hole); later attempts reuse
      that plane (`--board-plane`), the same posture rule, so the same kinematic error.
    * Belief. A hold (the peg upright in the hole mouth: the tip on the hole axis) makes the next

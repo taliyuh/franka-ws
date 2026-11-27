@@ -47,12 +47,13 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-from board_pipeline import beliefgrid, boardheight, holefit, ros
+from board_pipeline import beliefgrid, boardheight, grasp, holefit, ros
 from board_pipeline.config import Config, PipelineError, load_yaml
 from board_pipeline.session import sha256
 
@@ -88,25 +89,31 @@ def hole_leads(cfg: Config, holes: dict, name: str) -> tuple[str, dict]:
     return nearest, table[nearest]
 
 
-def choose_lead(entry: dict, hole_yaw_base: float, preferred_deg: float, s: dict | None = None,
-                error_m: float | None = None) -> tuple[dict, float]:
-    """Among the leads that dip: the fewest lines for the error disc (line_plan; with s and error_m), then the
-    simulation's group order (group 0: its best lead and its symmetric copies), then the slide nearest the preferred
-    base direction (2026-11-21: that direction alone decided among group 0 before). Returns (lead, slide direction in
-    base, rad)."""
-    best = None
+def ordered_leads(entry: dict, hole_yaw_base: float, preferred_deg: float, s: dict | None = None,
+                  error_m: float | None = None) -> list[tuple[dict, float]]:
+    """All dipping leads sorted by fewest lines for the error disc, simulation group order, then nearest to the
+    preferred base slide direction. Returns [(lead, slide_rad), ...]."""
+    ranked = []
     for lead in entry["leads"]:
         if lead.get("dips") is False:
             continue
         angle = hole_yaw_base + math.radians(lead["d_deg"])
         gap = abs(math.remainder(angle - math.radians(preferred_deg), 2 * math.pi))
         lines = line_plan(lead, s, error_m)["lines"] if s is not None and error_m is not None else 0
-        key = (lines, lead.get("group", 0), gap)
-        if best is None or key < best[0]:
-            best = (key, lead, angle)
-    if best is None:
+        ranked.append(((lines, lead.get("group", 0), gap), lead, math.remainder(angle, 2 * math.pi)))
+    if not ranked:
         raise PipelineError("no lead of this hole dips in the simulation (tilt_leads.yaml)")
-    return best[1], math.remainder(best[2], 2 * math.pi)
+    ranked.sort(key=lambda item: item[0])
+    return [(lead, slide) for _, lead, slide in ranked]
+
+
+def choose_lead(entry: dict, hole_yaw_base: float, preferred_deg: float, s: dict | None = None,
+                error_m: float | None = None) -> tuple[dict, float]:
+    """Among the leads that dip: the fewest lines for the error disc (line_plan; with s and error_m), then the
+    simulation's group order (group 0: its best lead and its symmetric copies), then the slide nearest the preferred
+    base direction (2026-11-21: that direction alone decided among group 0 before). Returns (lead, slide direction in
+    base, rad)."""
+    return ordered_leads(entry, hole_yaw_base, preferred_deg, s, error_m)[0]
 
 
 def lead_kind(lead: dict) -> str:
@@ -144,6 +151,69 @@ def line_plan(lead: dict, s: dict, error_m: float) -> dict:
 def round_lead(entry: dict, preferred_deg: float) -> tuple[dict, float]:
     """The round hole: any direction; slide along the preferred one."""
     return entry["leads"][0], math.radians(preferred_deg)
+
+
+def search_tilt_deg(s: dict) -> float:
+    """The tilt search's tilt (peg_search_options --tilt-deg, 4 deg when absent)."""
+    opts = [str(v) for v in s.get("peg_search_options") or []]
+    return float(opts[opts.index("--tilt-deg") + 1]) if "--tilt-deg" in opts else 4.0
+
+
+def slide_reachable(seed_q, tip_tcp, hole_xyz, lead: dict, slide_rad: float, s: dict, error_m: float) -> str | None:
+    """None if the tilted hand reaches both ends of the outer lines of a slide along slide_rad (the tip at the board,
+    tilted +-the search's tilt about the axis across the slide, the arm angle held at the approach's) with each joint
+    insert.round_slide_joint_margin_rad inside its limits (nominal IK from seed_q, the approach pose); else why not."""
+    from board_pipeline import panda  # lazy: OpenCV
+    from scipy.spatial.transform import Rotation
+    seed = np.asarray(seed_q, float)
+    t0 = panda.fk(seed, "panda_hand_tcp")
+    tip = np.asarray(tip_tcp, float)
+    margin = float(s.get("round_slide_joint_margin_rad", 0.1))
+    psi = panda.arm_angle(seed)
+    d = np.array([math.cos(slide_rad), math.sin(slide_rad), 0.0])
+    a = np.array([-d[1], d[0], 0.0])
+    plan = line_plan(lead, s, error_m)
+    half = 0.5 * (plan["lines"] - 1) * plan["spacing_m"]
+    back = float(lead["lead_run_up_m"]) + float(lead["peg_radius_m"])
+    hole = np.asarray(hole_xyz, float)
+    tilt = math.radians(search_tilt_deg(s))
+    for along in (-back, -back + float(lead["slide_length_m"])):
+        for across in {plan["centre_m"] - half, plan["centre_m"] + half}:
+            p = hole + along * d + across * a
+            for sign in (1.0, -1.0):
+                rot = Rotation.from_rotvec(sign * tilt * a).as_matrix() @ t0[:3, :3]
+                target = np.eye(4)
+                target[:3, :3] = rot
+                target[:3, 3] = p - rot @ tip
+                q, residual = panda.ik(target, seed, arm_angle_rad=psi)
+                if residual > 1e-3:
+                    return f"unreachable at {along * 1e3:+.0f} mm along (IK residual {residual:.1e})"
+                inside = np.minimum(q - panda.LOWER, panda.UPPER - q)
+                j = int(np.argmin(inside))
+                if inside[j] < margin:
+                    return f"joint {j + 1} {inside[j]:.2f} rad from its limit at {along * 1e3:+.0f} mm along"
+    return None
+
+
+def random_round_slide(seed_q, tip_tcp, hole_xyz, lead: dict, preferred_rad: float, s: dict, error_m: float,
+                       rng: np.random.Generator | None = None) -> tuple[float, str]:
+    """insert.round_slide_random: the round peg's slide direction in base, random (any is the same to a round hole) so
+    the tilt search does not press along the same path every insert; the first of insert.round_slide_tries uniform
+    draws that slide_reachable keeps, else the preferred direction. Returns (slide rad, what insert prints)."""
+    if seed_q is None:
+        return preferred_rad, "round slide: preferred direction (no approach joint angles to check the joint limits)"
+    rng = rng if rng is not None else np.random.default_rng()
+    tries = int(s.get("round_slide_tries", 12))
+    rejected = []
+    for _ in range(tries):
+        slide = float(rng.uniform(-math.pi, math.pi))
+        why = slide_reachable(seed_q, tip_tcp, hole_xyz, lead, slide, s, error_m)
+        if why is None:
+            return slide, (f"round slide: random {math.degrees(slide):+.1f} deg in base"
+                           + (f" ({len(rejected)} draw(s) rejected: {rejected[-1]})" if rejected else ""))
+        rejected.append(f"{math.degrees(slide):+.0f} deg {why}")
+    return preferred_rad, (f"round slide: preferred {math.degrees(preferred_rad):+.1f} deg; none of {tries} random "
+                           f"directions kept the joints in their limits (last: {rejected[-1]})")
 
 
 # ---------------------------------------------------------------- belief
@@ -273,18 +343,20 @@ def _rewrite_run_paths(argv: list, mapped_dir: str) -> list[str]:
 
 
 def robot_program(cfg: Config, s: dict, run_dir: Path, program: str, argv: list) -> int:
-    """Run build/<program> in the robot_session container with the run folder mounted; its exit code."""
+    """Run build/<program> in the robot_session container with the run folder mounted; its exit code. peg_search
+    from insert.peg_search_build instead of build/ when set (a hole_overrides trial binary)."""
     session_dir = robot_session_dir(cfg, s)
+    binary = f"./{s.get('peg_search_build') or 'build'}/{program}" if program == "peg_search" else f"./build/{program}"
     mapped = _container_run_dir(cfg, run_dir) if s.get("persistent_container", True) else None
     if mapped is not None:
         container = ensure_robot_container(cfg, s)
         exec_argv = _rewrite_run_paths(argv, mapped)
-        command = ["docker", "exec", "-i", container, f"./build/{program}", *exec_argv]
+        command = ["docker", "exec", "-i", container, binary, *exec_argv]
         print(f"  $ {program} " + shlex.join(map(str, argv[1:])), flush=True)
         return subprocess.run(command, stdin=subprocess.DEVNULL).returncode
     env = dict(os.environ, UID=str(os.getuid()), GID=str(os.getgid()), ROBOT=str(s["robot_ip"]), LOAD="")
     command = ["docker", "compose", "-f", str(session_dir / "docker-compose.yml"), "run",
-               "--rm", "-T", "-v", f"{run_dir}:{CONTAINER_RUN_DIR}", "robot", f"./build/{program}", *map(str, argv)]
+               "--rm", "-T", "-v", f"{run_dir}:{CONTAINER_RUN_DIR}", "robot", binary, *map(str, argv)]
     print(f"  $ {program} " + shlex.join(map(str, argv[1:])), flush=True)
     return subprocess.run(command, env=env, stdin=subprocess.DEVNULL).returncode
 
@@ -360,26 +432,98 @@ def extract_ik_seed(probe_argv: list | None) -> list[float] | None:
     return [float(v) for v in argv[i + 1: i + 8]]
 
 
+def free_air_trip(result: dict | None, min_tip_z: float | None) -> bool:
+    """A move stopped only by the force-change backstop, the tip still at or above min_tip_z (its planned heights, far
+    over the board and the pegs): control-loop jitter, not a touch (robot 2026-11-25: 20:38 and 21:04 transits, the
+    force estimate jumping 10 -> 30 -> 10 -> 45 N within ms, mid-air). Held back ("tip off the command") is a touch."""
+    if not result or result.get("ok") or min_tip_z is None:
+        return False
+    end = result.get("end_tip") or []
+    return ("external force changed" in str(result.get("error") or "") and len(end) == 3
+            and float(end[2]) >= float(min_tip_z))
+
+
+def gripper_state(cfg: Config, s: dict) -> dict | None:
+    """The hand's width (m) and is_grasped from build/gripper state; None if it could not be read."""
+    try:
+        container = ensure_robot_container(cfg, s)
+        text = subprocess.run(["docker", "exec", container, "./build/gripper", s["robot_ip"], "state"],
+                              capture_output=True, text=True, timeout=20).stdout
+    except (subprocess.SubprocessError, OSError, PipelineError):
+        return None
+    return parse_gripper_state(text)
+
+
+def parse_gripper_state(text: str) -> dict | None:
+    import re
+    m = re.search(r"width ([-0-9.eE+]+) mm .*?(not grasped|grasped)", text or "")
+    if not m:
+        return None
+    return {"width": float(m.group(1)) / 1000.0, "grasped": m.group(2) == "grasped"}
+
+
+def peg_still_held(state: dict | None, grasp_width_mm: float | None, s: dict) -> bool:
+    """The hand still closed on the peg: grasped, width within insert.free_air_held_eps_mm (inner, outer; extract's
+    grasp tolerances) of the seat width."""
+    if state is None or not grasp_width_mm:
+        return False
+    inner, outer = (float(v) for v in s.get("free_air_held_eps_mm") or (3.0, 1.0))
+    off = state["width"] * 1e3 - float(grasp_width_mm)
+    return bool(state["grasped"]) and -inner <= off <= outer
+
+
 def move_to_hole(cfg: Config, s: dict, run_dir: Path, target_q: list[float], name: str,
                  travel_z: float | None = None, target_z: float | None = None,
-                 tool=None, dq: list[float] | None = None, dry_run: bool = False) -> bool:
-    """peg_search move: joint-space travel to target_q via travel_z and straight down to target_z (zero ROS handover)."""
-    log = f"{CONTAINER_RUN_DIR}/{name}.csv"
-    argv = [s["robot_ip"], "move", log, "--target-q", *(f"{v:.8f}" for v in target_q),
-            *_tool_and_load_args(s, tool, dq), *_free_speed_args(s), *_backstop(s)]
-    if travel_z is not None:
-        argv += ["--travel-z", f"{travel_z:.6f}"]
-    if target_z is not None:
-        argv += ["--target-z", f"{target_z:.6f}"]
-    if not dry_run:
-        argv += ["--result", f"{CONTAINER_RUN_DIR}/{name}.json", "--yes"]
-    else:
-        argv += ["--dry-run"]
-    return robot_program(cfg, s, run_dir, "peg_search", argv) == 0
+                 tool=None, dq: list[float] | None = None, dry_run: bool = False, holding: bool = False) -> bool:
+    """peg_search move: joint-space travel to target_q via travel_z and straight down to target_z (zero ROS handover).
+    A free-air force-change trip (free_air_trip: the tip not below its planned heights) is retried up to
+    insert.free_air_trip_retries times (<name>_retry<k>), if holding only with the peg still in the hand."""
+    def argv_for(log_name: str) -> list:
+        argv = [s["robot_ip"], "move", f"{CONTAINER_RUN_DIR}/{log_name}.csv", "--target-q",
+                *(f"{v:.8f}" for v in target_q), *_tool_and_load_args(s, tool, dq), *_free_speed_args(s),
+                *_backstop(s)]
+        if travel_z is not None:
+            argv += ["--travel-z", f"{travel_z:.6f}"]
+        if target_z is not None:
+            argv += ["--target-z", f"{target_z:.6f}"]
+        if not dry_run:
+            argv += ["--result", f"{CONTAINER_RUN_DIR}/{log_name}.json", "--yes"]
+        else:
+            argv += ["--dry-run"]
+        return argv
+
+    if robot_program(cfg, s, run_dir, "peg_search", argv_for(name)) == 0:
+        return True
+    if dry_run:
+        return False
+    heights = [z for z in (travel_z, target_z) if z is not None]
+    min_tip_z = min(heights) - float(s.get("free_air_trip_margin_mm", 5.0)) / 1000.0 if heights else None
+    last = name
+    for k in range(1, int(s.get("free_air_trip_retries", 1)) + 1):
+        result_file = run_dir / f"{last}.json"
+        try:
+            result = json.loads(result_file.read_text())
+        except (OSError, ValueError):
+            result = None
+        if not free_air_trip(result, min_tip_z):
+            return False
+        if holding:
+            state = gripper_state(cfg, s)
+            if not peg_still_held(state, getattr(tool, "grasp_width_mm", None), s):
+                print(f"\nfree-air force trip, but the hand does not hold the peg as before ({state}): no retry")
+                return False
+        print(f"\n== free-air force trip ({result.get('error')}; tip {result['end_tip'][2] * 1e3:.1f} mm, planned "
+              f">= {min_tip_z * 1e3:.1f}): the move again ({k}) ==", flush=True)
+        time.sleep(float(s.get("free_air_trip_wait_s", 1.0)))
+        last = f"{name}_retry{k}"
+        if robot_program(cfg, s, run_dir, "peg_search", argv_for(last)) == 0:
+            return True
+    return False
 
 
 def lift(cfg: Config, s: dict, run_dir: Path, distance: float, name: str, tool=None,
-         dq: list[float] | None = None, result: bool = False, to_z: float | None = None) -> bool:
+         dq: list[float] | None = None, result: bool = False, to_z: float | None = None,
+         to_xy=None, upright: bool = False) -> bool:
     """peg_search lift: the tip straight up, down if negative (libfranka's joint position controller; stops if held
     back). Passes tool geometry, load, and joint offsets so NE_T_EE, gravity, and FK match the run. result: write
     <name>.json (the start pose: after a release, where extract finds the peg again)."""
@@ -387,14 +531,38 @@ def lift(cfg: Config, s: dict, run_dir: Path, distance: float, name: str, tool=N
     extra = ["--result", f"{CONTAINER_RUN_DIR}/{name}.json"] if result else []
     if to_z is not None:  # to a tip height (the travel heights) instead of a distance
         extra += ["--to-z", f"{to_z:.5f}"]
+    if to_xy is not None:  # the tip also to this base xy (at most 20 mm away)
+        extra += ["--to-xy", f"{float(to_xy[0]):.6f}", f"{float(to_xy[1]):.6f}"]
+    if upright:
+        extra += ["--upright"]
     return robot_program(cfg, s, run_dir, "peg_search", [s["robot_ip"], "lift", log, "--lift-m", f"{distance:.5f}",
                                                          *_tool_and_load_args(s, tool, dq), *_free_speed_args(s),
                                                          *_backstop(s), *extra, "--yes"]) == 0
 
 
-def open_hand(cfg: Config, s: dict, run_dir: Path) -> bool:
-    return robot_program(cfg, s, run_dir, "gripper",
-                         [s["robot_ip"], "open", f"{float(s['release_width_mm']) / 1000.0:g}"]) == 0
+def release_width_mm(s: dict, tool=None, holes: dict | None = None, hole_name: str | None = None) -> float:
+    """How wide the hand opens to let go of a peg: the peg's grasp width + insert.release_margin_mm, at most
+    release_width_mm (2026-11-25: 30 mm around the 2 mm triangle grasp swung a finger into the hexagon seated next to
+    it in the 0.2 mm row and stopped the lift), and capped dynamically so the v3 fingers keep
+    insert.neighbor_clearance_mm from neighboring holes."""
+    full = float(s["release_width_mm"])
+    margin, grasp_w = s.get("release_margin_mm"), getattr(tool, "grasp_width_mm", None)
+    width = full if (margin is None or not grasp_w) else min(full, float(grasp_w) + float(margin))
+    if holes and hole_name and tool is not None:
+        min_w = float(grasp_w) + 2.0 if grasp_w else None
+        capped, capped_by, clear_mm = grasp.safe_open_width_mm(
+            tool, holes, hole_name, width,
+            min_clearance_mm=s.get("neighbor_clearance_mm", 2.5), min_width_mm=min_w)
+        if capped_by is not None and capped < width - 0.05:
+            print(f"neighbor clearance cap: release width {width:.1f} -> {capped:.1f} mm "
+                  f"({clear_mm:.1f} mm clear of {capped_by})")
+        width = capped
+    return width
+
+
+def open_hand(cfg: Config, s: dict, run_dir: Path, width_mm: float | None = None) -> bool:
+    width = float(s["release_width_mm"]) if width_mm is None else float(width_mm)
+    return robot_program(cfg, s, run_dir, "gripper", [s["robot_ip"], "open", f"{width / 1000.0:g}"]) == 0
 
 
 def _container(cfg: Config, script: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
@@ -521,13 +689,14 @@ def search_error(s: dict, entry: dict) -> float:
     return float(s["error_m"]) if s.get("error_m") is not None else float(entry["error_m"])
 
 
-def sized_lead(lead: dict, table_error_m: float, error_m: float) -> dict:
+def sized_lead(lead: dict, table_error_m: float, error_m: float, lag_margin_m: float = 0.0) -> dict:
     """The lead's search sized for error_m instead of the table's disc: run-up (error + near rim + 3 mm), spiral
-    radius (error + hole + 3 mm) less the difference, slide length (run-up + error + far rim + 3 mm) less twice it."""
+    radius (error + hole + 3 mm) less the difference, slide length (run-up + error + far rim + 3 mm + lag_margin_m)
+    less twice shrink."""
     shrink = table_error_m - error_m
     out = dict(lead, table_error_m=table_error_m, error_m=error_m)
     out["lead_run_up_m"] = float(lead["lead_run_up_m"]) - shrink
-    out["slide_length_m"] = float(lead["slide_length_m"]) - 2.0 * shrink
+    out["slide_length_m"] = float(lead["slide_length_m"]) - 2.0 * shrink + float(lag_margin_m)
     out["spiral_radius_m"] = float(lead["spiral_radius_m"]) - shrink
     if out["lead_run_up_m"] <= error_m or out["slide_length_m"] <= 2.0 * error_m:
         raise PipelineError(f"lead {lead['lead']}: the search does not fit a {error_m * 1e3:g} mm error disc")
@@ -545,16 +714,131 @@ def board_ref_travel(lead: dict, s: dict, error_m: float) -> float:
     return max(0.0, min(cap, free))
 
 
-def search_args(lead: dict, slide_rad: float, s: dict, pattern: str, error_m: float) -> list:
+CORNER_IN_MODES = ("auto", "on", "off")
+
+
+def corner_in_plan(lead: dict, s: dict, clearance_mm: float, found_holes: int, shape: str | None = None,
+                   mode: str | None = None) -> tuple[float | None, str | None]:
+    """(distance inside the near rim to start a corner-in search or None: the normal tilt slide from on the board,
+    the line insert prints about it or None).
+    The lead: a corner, or the flat edge of a shape of insert.corner_in_edge_shapes (the hexagon: edge-in; never the
+    round peg). mode (insert --corner-in, else insert.corner_in): off never; auto on such a hole of
+    insert.corner_in_shapes (all shapes when absent) at most corner_in_max_clearance_mm (null: any) once
+    corner_in_min_found_holes found holes of the current board pose calibrate it; on any such shape at that clearance, without the found-hole
+    gate. An explicit insert.start_in_hole_m (insert.hole_overrides) is used in auto and on."""
+    mode = mode or s.get("corner_in") or "auto"
+    if mode not in CORNER_IN_MODES:
+        raise PipelineError(f"insert.corner_in {mode!r}: one of {', '.join(CORNER_IN_MODES)}")
+    if mode == "off":
+        return None, "corner-in: off (--corner-in off); normal tilt search" if s.get("start_in_hole_m") else None
+    if s.get("start_in_hole_m"):
+        depth = float(s["start_in_hole_m"])
+        return depth, f"corner-in: starting lead {depth * 1e3:.2f} mm inside near rim (insert.start_in_hole_m)"
+    max_clr = s.get("corner_in_max_clearance_mm")
+    max_clr = math.inf if max_clr is None else float(max_clr)
+    kind = lead_kind(lead)
+    edge_ok = shape is not None and shape != "round" and shape in (s.get("corner_in_edge_shapes") or [])
+    if clearance_mm > max_clr or "near_m" not in lead or not (kind == "corner" or (kind == "flat" and edge_ok)):
+        return None, None
+    what = "corner-in" if kind == "corner" else "edge-in"
+    min_found = int(s.get("corner_in_min_found_holes", 2))
+    shapes = s.get("corner_in_shapes")
+    if mode == "auto":
+        if shape is not None and shapes is not None and shape not in shapes:
+            return None, (f"{what}: not by default for {shape} (insert.corner_in_shapes {list(shapes)}); "
+                          "normal tilt search (--corner-in on to start inside the hole)")
+        if found_holes < min_found:
+            return None, (f"{what}: skipped ({found_holes} < {min_found} found holes of this board pose); normal "
+                          "tilt search (--corner-in on to start inside the hole anyway)")
+    near = float(lead["near_m"])
+    frac = float(s.get("corner_in_near_fraction", 0.55))
+    d_min = float(s.get("corner_in_min_m", 0.0025))
+    d_max = float(s.get("corner_in_max_m", 0.0045))
+    depth = min(max(d_min, min(d_max, frac * near)), near - 0.0005)
+    if s.get("corner_in_dip_cap", True) and lead.get("along_m"):
+        # not past where the lead dips (tilt_leads along_m[0] from the centre): 0.55 near is past it in the loose
+        depth = min(depth, near + float(lead["along_m"][0]))  # holes (triangle_c3mm: 3.6 mm in, it dips at 2.9)
+    if depth <= 0.0:
+        return None, None
+    note = f"{what}: starting lead {depth * 1e3:.2f} mm inside near rim ({found_holes} found hole(s))"
+    if mode == "on":
+        forced = [why for why, cond in (
+            (f"{shape} not in insert.corner_in_shapes", shape is not None and shapes is not None and shape not in shapes),
+            (f"only {found_holes} < {min_found} found holes: the vision hole", found_holes < min_found)) if cond]
+        note += " (--corner-in on" + (f": {'; '.join(forced)}" if forced else "") + ")"
+    return depth, note
+
+
+def corner_in_depth(lead: dict, s: dict, clearance_mm: float, found_holes: int, shape: str | None = None,
+                    mode: str | None = None) -> float | None:
+    """corner_in_plan's distance inside the near rim (None: normal tilt slide from on the board)."""
+    return corner_in_plan(lead, s, clearance_mm, found_holes, shape=shape, mode=mode)[0]
+
+
+def dip_slice_along(lead: dict) -> tuple[float, float] | None:
+    """(a_min, a_max) along the slide direction d where the lead's dip_region_m polygon intersects the centre slide line
+    (lead across = mid(eff_band_m)), or None when dip_region_m is absent. Used by corner_in_lead for concave holes
+    (l_shape) whose inner notch pushes the hole opening past the hole centre (a_min > 0)."""
+    pts = lead.get("dip_region_m")
+    if not pts or "d_deg" not in lead:
+        return None
+    pts = np.asarray(pts, float)
+    rad = math.radians(float(lead["d_deg"]))
+    d = np.array([math.cos(rad), math.sin(rad)])
+    a = np.array([-math.sin(rad), math.cos(rad)])
+    along = pts @ d
+    across = pts @ a
+    eb = lead.get("eff_band_m") or lead.get("band_m")
+    ac = 0.5 * (float(eb[0]) + float(eb[1])) if eb else 0.0
+    xs = []
+    n = len(pts)
+    for i in range(n):
+        y1, y2 = float(across[i]), float(across[(i + 1) % n])
+        if (y1 <= ac < y2) or (y2 <= ac < y1):
+            t = (ac - y1) / (y2 - y1)
+            xs.append(float(along[i]) + t * (float(along[(i + 1) % n]) - float(along[i])))
+    xs.sort()
+    if len(xs) < 2:
+        return None
+    return max(((xs[i], xs[i + 1]) for i in range(0, len(xs) - 1, 2)), key=lambda ab: ab[1] - ab[0])
+
+
+def corner_in_lead(lead: dict, s: dict, start_in_hole_m: float | None = None) -> dict:
+    """insert.start_in_hole_m (or generalized corner_in_depth): the lead starts that far inside the
+    hole's near rim (run-up = near rim - it) and the slide ends 1 mm + lag_margin past the far rim, instead of a
+    run-up from 3 mm beyond the error disc across the board (peg_search --start-in-hole). For concave holes whose
+    dip_region_m on the centre line opens past the hole centre (l_shape: a_min > 0), starts inside that opening
+    (negative lead_run_up_m)."""
+    inside = start_in_hole_m if start_in_hole_m is not None else s.get("start_in_hole_m")
+    if not inside or "near_m" not in lead:
+        return lead
+    sl = dip_slice_along(lead)
+    if sl is not None and sl[0] > 0.0:
+        a0, a1 = sl
+        run_up = -(a0 + min(float(inside), 0.5 * (a1 - a0)))
+    else:
+        run_up = float(lead["near_m"]) - float(inside)
+        if run_up <= 0.0:
+            raise PipelineError(f"insert.start_in_hole_m {float(inside) * 1e3:g} mm is past the hole centre")
+    lag_margin = float(s.get("slide_lag_margin_m", 0.0))
+    return dict(lead, lead_run_up_m=run_up, slide_length_m=run_up + float(lead["far_m"]) + 0.001 + lag_margin)
+
+
+def search_args(lead: dict, slide_rad: float, s: dict, pattern: str, error_m: float,
+                start_in_hole_m: float | None = None) -> list:
+    inside = start_in_hole_m if start_in_hole_m is not None else s.get("start_in_hole_m")
+    lead = corner_in_lead(lead, s, start_in_hole_m=inside)
     plan = line_plan(lead, s, error_m)
     spacing, lines = plan["spacing_m"], plan["lines"]
     args = ["--line-centre", f"{plan['centre_m']:.5f}", "--pattern", pattern, "--slide-dir-deg", f"{math.degrees(slide_rad):.3f}",
             "--peg-radius", f"{lead['peg_radius_m']:.5f}", "--lead-across", f"{lead['lead_across_m']:.5f}",
             "--lead-run-up", f"{lead['lead_run_up_m']:.5f}", "--slide-length", f"{lead['slide_length_m']:.5f}",
             "--hole-error", f"{error_m:.4f}", "--located-radius", f"{min(float(s['located_radius_m']), error_m):.4f}"]
-    ref = board_ref_travel(lead, s, error_m)
+    ref = 0.0 if inside else board_ref_travel(lead, s, error_m)
     if ref > 0.0:
         args += ["--board-ref-travel", f"{ref:.5f}"]
+    if inside:
+        args += ["--start-in-hole"]
     if pattern == "lines":
         args += ["--lines", lines, "--line-spacing", f"{spacing:.5f}"]
     else:
@@ -576,18 +860,22 @@ def touch_points(holes: dict, name: str, tool, board: np.ndarray, surface_z: flo
 
 def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: list, summary: dict, attempts: int,
                       height_mm: float, hole_base, touch_base, lead: dict, error_m: float, grid=None, tool=None,
-                      dq: list[float] | None = None, heights: dict | None = None) -> bool:
+                      dq: list[float] | None = None, heights: dict | None = None, plunge: bool = True,
+                      lead_candidates: list[tuple[dict, float]] | None = None, start_in_hole_m: float | None = None,
+                      common_prefix: list | None = None, pattern: str | None = None, free_hole=None) -> bool:
     """insert.method plunge: one position-controlled plunge, the board touched (3-point local plane; with the board
     height model one touch and its slope, or none and its height), then the tilt search attempts. grid
     (beliefgrid.HoleGrid, --search grid): the attempts' lines planned on it. heights (boardheight, from run): "slope"
     the robot's board slope in base, "z_hole" its predicted height at the hole (None: no model), "record" a callable
-    that keeps the touches."""
-    print("\n== plunge: straight down over the vision hole (position control) ==", flush=True)
+    that keeps the touches. plunge False: drop_argv only touches the board (--peck-max-points 0), attempt 0 is
+    logged as method "touch"."""
+    print("\n== plunge: straight down over the vision hole (position control) ==" if plunge else
+          "\n== board touches (no plunge: tight hole) ==", flush=True)
     code = peg_search(cfg, s, out, drop_argv)
     result_file = out / "peck.json"
     last = json.loads(result_file.read_text()) if result_file.exists() else \
         {"ok": False, "stage": "unknown", "error": f"peg_search exited {code} without a result"}
-    summary["attempts"].append({"attempt": 0, "method": "plunge", "exit": code, **{
+    summary["attempts"].append({"attempt": 0, "method": "plunge" if plunge else "touch", "exit": code, **{
         key: last.get(key) for key in ("ok", "stage", "error", "inserted", "board_measured", "plane", "first",
                                        "end_tip")}})
     if last.get("inserted"):
@@ -646,7 +934,7 @@ def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: 
         f"{contact_z * 1e3:.2f} mm, {(board_z - contact_z) * 1e3:.2f} mm below the board"
     slope_note = (f", slope ({use_plane['slope'][0] * 1e3:+.1f}, {use_plane['slope'][1] * 1e3:+.1f}) um/mm"
                   if use_plane is not None else ", no measured slope (online board plane)")
-    print(f"\nplunge: not in. The robot's heights: board {board_z * 1e3:.2f} mm (touched{slope_note}; vision "
+    print(f"\n{'plunge: not in' if plunge else 'touched'}. The robot's heights: board {board_z * 1e3:.2f} mm (touched{slope_note}; vision "
           f"{hole_base[2] * 1e3:.2f} mm), the plunge's contact {contact}: {first.get('result')}")
     plane = use_plane if use_plane is not None else \
         {"point": [float(touch_base[0]), float(touch_base[1]), board_z], "slope": [0.0, 0.0]}
@@ -658,6 +946,17 @@ def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: 
     approach = (height_mm + float(s["approach_known_margin_mm"])) / 1000.0
     belief = {"xy": [float(v) for v in first["xy"]], "radius_m": min(float(s["located_radius_m"]), error_m),
               "source": "plunge stuck in the hole mouth"} if stuck else None
+    shallow_streak = 0
+    lead_idx = 0
+    cur_lead = lead
+    cur_common = common
+    if start_in_hole_m and use_plane is None and lead_candidates and common_prefix is not None:
+        # peg_search --start-in-hole needs --board-plane: without one, the normal slide onto the hole from the board
+        print("corner-in: no board plane from the touches; normal tilt search", flush=True)
+        start_in_hole_m = None
+        cur_common = [*common_prefix, *map(str, search_args(lead, lead_candidates[0][1], s, pattern or "lines",
+                                                            error_m, start_in_hole_m=0.0))]
+    cur_grid = grid
     for k in range(1, attempts + 1):
         if k > 1:  # upright and at the start height again (a failed run leaves the peg tilted, anywhere)
             print(f"\n== reset: the peg upright, the tip {height_mm:g} mm above the board ==", flush=True)
@@ -670,11 +969,11 @@ def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: 
                        *(f"{v:.6f}" for v in use_plane["slope"])]
                       if use_plane is not None else ["--probe-points", "0"])
         argv = [s["robot_ip"], "tilt-slide", f"{CONTAINER_RUN_DIR}/attempt_{k}.csv", "--approach", f"{approach:.4f}",
-                *common, "--board-z", f"{board_z:.6f}", *plane_args,
+                *cur_common, "--board-z", f"{board_z:.6f}", *plane_args,
                 "--posture", "start", "--result", f"{CONTAINER_RUN_DIR}/attempt_{k}.json"]
         plan = None
-        if grid is not None:
-            plan, extra = grid_args(grid, s, lead, error_m, out, k)
+        if cur_grid is not None:
+            plan, extra = grid_args(cur_grid, s, cur_lead, error_m, out, k)
             argv += extra
         elif belief is not None:
             argv += ["--located-xy", f"{belief['xy'][0]:.6f}", f"{belief['xy'][1]:.6f}",
@@ -683,7 +982,7 @@ def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: 
             in_depth = max(0.001, min(0.002, board_z - contact_z - 0.0005))
             argv += ["--plunge", f"{board_z:.6f}", "--plunge-in-depth", f"{in_depth:.4f}"]
         if plan is not None:
-            where = (("compliant plunge at the stuck spot, then " if k == 1 and stuck else "") + grid_text(grid, plan))
+            where = (("compliant plunge at the stuck spot, then " if k == 1 and stuck else "") + grid_text(cur_grid, plan))
         elif k == 1 and stuck:
             where = f"compliant plunge at the stuck spot, then located search {belief['radius_m'] * 1e3:g} mm about it"
         elif belief:
@@ -701,8 +1000,8 @@ def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: 
                                            "dip_lead", "end_tip")}})
         if last.get("plunge") not in (None, "none"):
             print(f"plunge: {last['plunge']}")
-        if grid is not None:
-            grid_update(grid, s, last, out, k)
+        if cur_grid is not None:
+            grid_update(cur_grid, s, last, out, k)
         if last.get("inserted"):
             print(f"\ninserted on tilt search attempt {k}")
             summary["inserted_by"] = last
@@ -712,9 +1011,25 @@ def _plunge_then_tilt(cfg: Config, s: dict, out: Path, drop_argv: list, common: 
             return False
         if not last.get("ok"):
             print(f"attempt {k} failed ({last.get('stage')}): {last.get('error')}")
-        if grid is not None:
+        is_shallow = (last.get("outcomes") == ["shallow"])
+        shallow_streak = shallow_streak + 1 if is_shallow else 0
+        if shallow_streak >= int(s.get("max_shallow_attempts", 2)):
+            print(f"stopping after {shallow_streak} shallow attempts to avoid grooving the board", flush=True)
+            return False
+        if ((is_shallow or start_in_hole_m) and lead_candidates and len(lead_candidates) > 1
+                and common_prefix is not None and k < attempts):
+            lead_idx = (lead_idx + 1) % len(lead_candidates)
+            cur_lead, new_slide = lead_candidates[lead_idx]
+            cur_common = [*common_prefix, *map(str, search_args(cur_lead, new_slide, s, pattern or "lines",
+                                                                 error_m, start_in_hole_m=start_in_hole_m))]
+            if cur_grid is not None and free_hole is not None:
+                cur_grid = make_grid(s, hole_base, error_m, cur_lead, new_slide, free_hole,
+                                     line_plan(cur_lead, s, error_m)["spacing_m"])
+            print(f"switching to symmetric lead {cur_lead['lead']} (slide {math.degrees(new_slide):+.1f} deg) "
+                  f"for attempt {k + 1}", flush=True)
+        if cur_grid is not None:
             continue
-        belief = next_belief(last, lead, s, belief, prior_xy=belief["xy"] if belief else hole_base[:2],
+        belief = next_belief(last, cur_lead, s, belief, prior_xy=belief["xy"] if belief else hole_base[:2],
                              prior_radius=belief["radius_m"] if belief else error_m, max_radius=error_m)
         summary["belief"] = belief
         if belief is not None:
@@ -795,6 +1110,8 @@ def _centre_and_record(cfg, s, out, session, args, tool, entry, holes, table_nam
     found = None
     clearance_mm = float(holes[args.hole]["clearance_mm"])
     min_centre_mm = float(s.get("centre_min_clearance_mm", 0.5))
+    ins_by = summary.get("inserted_by") or {}
+    from_tilt = ins_by.get("method") != "peck" and ("plunge" in ins_by or bool(ins_by.get("outcomes")))
     if s.get("centre_after_insert", True) and not getattr(args, "no_centre", False):
         if clearance_mm < min_centre_mm:
             print(f"\ncentre: skipped for {args.hole} (clearance {clearance_mm:g} mm < {min_centre_mm:g} mm; "
@@ -815,20 +1132,34 @@ def _centre_and_record(cfg, s, out, session, args, tool, entry, holes, table_nam
             result = json.loads(result_file.read_text()) if result_file.exists() else {"ok": False}
             summary["centre"] = {k: result.get(k) for k in ("ok", "stage", "error", "contacts", "touches")}
             if code == 0 and result.get("ok"):
+                n_contacts = sum(1 for t in (result.get("touches") or []) if t.get("contact"))
+                min_verify = int(s.get("centre_min_verify_contacts", 2))
+                if n_contacts < min_verify:
+                    print(f"centre: only {n_contacts}/{len(dirs)} wall contacts — peg may not be in the hole; "
+                          "keeping peg held", flush=True)
+                    summary["stopped"] = (f"centre found only {n_contacts}/{len(dirs)} wall contacts "
+                                          "(peg not in hole?)")
+                    return None
                 guess = seat if seat is not None else hole_base[:2]
                 found = holefit.found_from_touches(result, free, yaw_base, guess, max_delta=2.0e-4 + extra)
                 if found is None:
                     print("centre: the touches do not pin the hole (too few, one-sided, or off its outline): the seated tip")
+                elif from_tilt:
+                    found["source"] = found["source"].replace("wall touches", "wall touches (tilt)")
+                    found["sigma_m"] = max(found["sigma_m"], float(s.get("tilt_wall_sigma_m", 0.0008)))
             else:
                 print(f"centre: failed ({result.get('error')}): the seated tip")
     if found is None:
         if seat is None:
             print("no position of the inserted peg to record")
             return None
-        found = holefit.found_from_seat(seat, free, f"seated tip ({seat_key})")
+        src = f"seated tip (tilt, {seat_key})" if from_tilt else f"seated tip ({seat_key})"
+        found = holefit.found_from_seat(seat, free, src)
         found["sigma_m"] += extra
+        if from_tilt:
+            found["sigma_m"] = max(found["sigma_m"], float(s.get("tilt_seat_sigma_m", 0.001)))
     entry_ = holefit.record_found(session.path, args.hole, vision_base[:2], found, board_sha, out.name,
-                                  arm_angle_deg=arm_angle_deg(tool))
+                                  arm_angle_deg=arm_angle_deg(tool), tip_offset=tool.tip_offset)
     off = np.asarray(found["xy"]) - np.asarray(vision_base[:2])
     print(f"found {args.hole} at ({found['xy'][0] * 1e3:.2f}, {found['xy'][1] * 1e3:.2f}) mm, "
           f"({off[0] * 1e3:+.2f}, {off[1] * 1e3:+.2f}) mm from vision, +-{found['sigma_m'] * 1e3:.2f} mm, "
@@ -883,9 +1214,17 @@ def import_runs(session) -> list[dict]:
 def correction_entries(entries: list[dict], s: dict, holes: dict) -> list[dict]:
     """The found holes the board correction is fitted to: not those of insert.correction_exclude_shapes, whose found
     position carries their peg's own tip error (2026-11-23: the L's ~1-2 mm, not the board's, and it depends on the
-    tip file the run used), nor those found with the elbow turned (boardheight.at_elbow_zero)."""
+    tip file the run used), nor those found with the elbow turned (boardheight.at_elbow_zero), nor tilted tilt-search
+    seated tips on loose holes (>= insert.centre_min_clearance_mm) when insert.correction_exclude_tilt_seats is true
+    (tight holes skip wall touches because the bore already pins the peg to the hole centre)."""
     skip = set(s.get("correction_exclude_shapes") or [])
-    return [e for e in entries if (holes.get(e["hole"]) or {}).get("shape") not in skip and boardheight.at_elbow_zero(e)]
+    excl_tilt = bool(s.get("correction_exclude_tilt_seats", True))
+    min_centre = float(s.get("centre_min_clearance_mm", 0.5))
+    return [e for e in entries
+            if (holes.get(e["hole"]) or {}).get("shape") not in skip
+            and boardheight.at_elbow_zero(e)
+            and not (excl_tilt and str(e.get("source", "")).startswith("seated tip (tilt")
+                     and float((holes.get(e["hole"]) or {}).get("clearance_mm", min_centre)) >= min_centre)]
 
 
 def _report_heights(session, sha: str | None) -> None:
@@ -998,6 +1337,10 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     Returns {"inserted", "stopped", "out", "summary"}; raise_on_fail False: also when it did not insert."""
     cfg = session.cfg
     s = settings(cfg)
+    override = (s.get("hole_overrides") or {}).get(args.hole)
+    if override:
+        s = {**s, **override}
+        print(f"insert: {args.hole} overrides (insert.hole_overrides): {override}")
     holes = load_yaml(cfg.path(cfg["holes"]))["holes"]
     if args.hole not in holes:
         raise PipelineError(f"unknown hole {args.hole!r}; `pipeline holes` lists them")
@@ -1016,9 +1359,15 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     vision_base = peg_raw_board @ np.array([tool.point[0], tool.point[1], data["board_surface_z_m"], 1.0])
     correction = None
     if s.get("board_correction", True) and not getattr(args, "no_board_correction", False):
-        correction = holefit.local_correction(correction_entries(holefit.load_found(session.path), s, holes), board_sha,
-                                              at_xy=vision_base[:2] if s.get("correction_local", True) else None,
-                                              **local_options(s))
+        all_found = holefit.load_found(session.path)
+        psi_deg = arm_angle_deg(tool)
+        if abs(psi_deg) >= boardheight.ELBOW_ZERO_DEG:
+            correction = holefit.same_hole_elbow_correction(
+                all_found, args.hole, board_sha, psi_deg, tip_offset=tool.tip_offset)
+        if correction is None:
+            correction = holefit.local_correction(correction_entries(all_found, s, holes), board_sha,
+                                                  at_xy=vision_base[:2] if s.get("correction_local", True) else None,
+                                                  **local_options(s))
     if correction is not None:
         m_corr = holefit.full_matrix(correction)
         board = m_corr @ peg_raw_board
@@ -1033,14 +1382,19 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
         probe_argv = list(probe_argv)
         probe_argv[probe_argv.index("--board-pose") + 1] = ros.container_path(cfg, corrected)
         shift = holefit.correct_xy_full(vision_base[:2], correction) - vision_base[:2]
-        local = correction["local_m"]
-        print(f"board correction from {correction['holes']} found hole(s): rigid shift "
-              f"({correction['shift_m'][0] * 1e3:+.2f}, {correction['shift_m'][1] * 1e3:+.2f}) mm "
-              f"(+-{correction['sigma_shift_m'] * 1e3:.2f}), turn {correction['turn_deg']:+.3f} deg "
-              f"(+-{correction['sigma_turn_deg']:.3f}); local here ({local[0] * 1e3:+.2f}, {local[1] * 1e3:+.2f}) mm "
-              f"(+-{correction['local_sigma_m'] * 1e3:.2f}); this hole moves ({shift[0] * 1e3:+.2f}, "
-              f"{shift[1] * 1e3:+.2f}) mm"
-              + (f"; dropped {', '.join(d['hole'] for d in correction['dropped'])}" if correction["dropped"] else ""))
+        if correction.get("elbow_same_hole"):
+            print(f"elbow posture correction from {correction['holes']} prior run(s) of {args.hole} at arm angle "
+                  f"{correction['arm_angle_deg']:+.1f} deg: shift ({shift[0] * 1e3:+.2f}, {shift[1] * 1e3:+.2f}) mm "
+                  f"(+-{correction['sigma_shift_m'] * 1e3:.2f})")
+        else:
+            local = correction["local_m"]
+            print(f"board correction from {correction['holes']} found hole(s): rigid shift "
+                  f"({correction['shift_m'][0] * 1e3:+.2f}, {correction['shift_m'][1] * 1e3:+.2f}) mm "
+                  f"(+-{correction['sigma_shift_m'] * 1e3:.2f}), turn {correction['turn_deg']:+.3f} deg "
+                  f"(+-{correction['sigma_turn_deg']:.3f}); local here ({local[0] * 1e3:+.2f}, {local[1] * 1e3:+.2f}) mm "
+                  f"(+-{correction['local_sigma_m'] * 1e3:.2f}); this hole moves ({shift[0] * 1e3:+.2f}, "
+                  f"{shift[1] * 1e3:+.2f}) mm"
+                  + (f"; dropped {', '.join(d['hole'] for d in correction['dropped'])}" if correction["dropped"] else ""))
     else:
         board = peg_raw_board
     hole_base = board @ np.array([tool.point[0], tool.point[1], data["board_surface_z_m"], 1.0])
@@ -1057,28 +1411,50 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
         if not chosen:
             raise PipelineError(f"insert.lead_group {shape}: {group}, but {table_name} has no lead of that group")
         entry = {**entry, "leads": chosen}
-    lead, slide = round_lead(entry, preferred) if shape == "round" else \
-        choose_lead(entry, hole_yaw_base, preferred, s, error_m)
-    lead = sized_lead(lead, float(entry["error_m"]), error_m)
+    candidates = [round_lead(entry, preferred)] if shape == "round" else \
+        ordered_leads(entry, hole_yaw_base, preferred, s, error_m)
+    lag_margin = float(s.get("slide_lag_margin_m", 0.0))
+    candidates = [(sized_lead(l, float(entry["error_m"]), error_m, lag_margin_m=lag_margin), sl) for l, sl in candidates]
+    lead, slide = candidates[0]
+    slide_note = None
+    if shape == "round" and args.slide_dir is None and s.get("round_slide_random", True):
+        slide, slide_note = random_round_slide(extract_ik_seed(probe_argv), tool.tip_offset, hole_base[:3], lead,
+                                               slide, s, error_m)
+        candidates = [(lead, slide)]
+    clearance_mm = float(holes[args.hole]["clearance_mm"])
+    found_count = int(correction["holes"]) if correction is not None else 0
+    in_hole_m, corner_in_note = corner_in_plan(lead, s, clearance_mm, found_count, shape=shape,
+                                               mode=getattr(args, "corner_in", None))
     line = line_plan(lead, s, error_m)
     # The round peg: straight lines always (no corners to lead with, no yaw error to search over).
     pattern = args.pattern or ("lines" if shape == "round" else s.get("pattern") or entry["pattern"])
+    # peg_search --start-in-hole needs lines and a given board plane (insert.method plunge: the touches give it)
+    run_method = args.method or s.get("method", "plunge")
+    if in_hole_m is not None and (pattern != "lines" or run_method != "plunge"):
+        why = f"the {pattern} pattern" if pattern != "lines" else f"method {run_method}"
+        corner_in_note = f"corner-in: not with {why} (it needs lines and the touches' board plane); normal tilt search"
+        in_hole_m = None
+    attempts_clr = s.get("corner_in_attempts_max_clearance_mm", 0.2)
+    if (in_hole_m is not None and args.attempts is None and not (override and "attempts" in override)
+            and (attempts_clr is None or clearance_mm <= float(attempts_clr))):
+        attempts = min(attempts, int(s.get("corner_in_attempts", 2)))
     # How later attempts are aimed: the belief grid (lines only; the spiral keeps the hold / dip belief).
     search = (getattr(args, "search", None) or s.get("search") or "grid") if pattern == "lines" else "belief"
-    grid = make_grid(s, hole_base, error_m, lead, slide, free_region(entry, holes, args.hole, table_name)[0],
+    free_hole = free_region(entry, holes, args.hole, table_name)[0]
+    grid = make_grid(s, hole_base, error_m, lead, slide, free_hole,
                      line["spacing_m"]) if search == "grid" else None
-    clearance_mm = float(holes[args.hole]["clearance_mm"])
     min_centre_mm = float(s.get("centre_min_clearance_mm", 0.5))
     insert_depth_m = (float(s["tight_insert_depth_m"])
                       if clearance_mm < min_centre_mm and s.get("tight_insert_depth_m") is not None
                       else float(s.get("peck_insert_depth_m", 0.015)))
     min_grasp_args = (["--min-grasp-width", f"{max(0.0006, float(tool.grasp_width_mm) / 1000.0 - 0.003):.5f}"]
                       if getattr(tool, "grasp_width_mm", None) else [])
-    common = [*map(str, s["peg_search_options"]), *_tool_and_load_args(s, tool, dq), *min_grasp_args,
-              *posture_args(tool),
-              "--probe-radius", f"{s['probe_radius_m']:g}", "--hole-xy", f"{hole_base[0]:.6f}", f"{hole_base[1]:.6f}",
-              "--board-z", f"{hole_base[2]:.6f}", "--insert-depth", f"{insert_depth_m:g}",
-              "--lift-at-end", "--yes", *map(str, search_args(lead, slide, s, pattern, error_m))]
+    common_prefix = [*map(str, s["peg_search_options"]), *_tool_and_load_args(s, tool, dq), *min_grasp_args,
+                     *posture_args(tool),
+                     "--probe-radius", f"{s['probe_radius_m']:g}", "--hole-xy", f"{hole_base[0]:.6f}", f"{hole_base[1]:.6f}",
+                     "--board-z", f"{hole_base[2]:.6f}", "--insert-depth", f"{insert_depth_m:g}",
+                     "--lift-at-end", "--yes"]
+    common = [*common_prefix, *map(str, search_args(lead, slide, s, pattern, error_m, start_in_hole_m=in_hole_m))]
 
     # Peck (holes with >= insert.peck_min_clearance_mm): position-controlled pecks on a grid about the vision hole.
     # Robot 2026-11-21, hexagon_c3mm near the base: the tilt search's Cartesian impedance lagged 3-11 mm in z there,
@@ -1112,6 +1488,15 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     if n_touches == 0 and not shape_known:
         print(f"note: no touches with the {shape} peg yet (its grasp's height offset): 1 touch")
         n_touches = 1
+    if n_touches == 0 and abs(arm_angle_deg(tool)) >= boardheight.ELBOW_ZERO_DEG:
+        print(f"note: elbow arm angle {arm_angle_deg(tool):+.1f} deg shifts the board height off the arm-angle 0 model: "
+              "1 touch")
+        n_touches = 1
+    # No plunge into tight holes (insert.no_plunge_max_clearance_mm; 2026-11-25: 5 of 25 went in at 0.2 mm, each miss
+    # ~8-10 s): the peck run only touches the board (at least once: this grasp's height), the tilt search follows.
+    no_plunge = method == "plunge" and clearance_mm <= float(s.get("no_plunge_max_clearance_mm", -1.0))
+    if no_plunge and n_touches == 0:
+        n_touches = 1
     peck_board_z = z_hole_pred if z_hole_pred is not None else float(hole_base[2])
     heights_ctx = None
     if hmodel is not None:
@@ -1135,7 +1520,7 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     touches = all_touches[:n_touches]
     touch_base = all_touches[0]
     touch_args = [v for pt in touches for v in ("--peck-touch", f"{pt[0]:.6f}", f"{pt[1]:.6f}")]
-    drop_argv = [*peck_argv, "--peck-max-points", "1", *touch_args]
+    drop_argv = [*peck_argv, "--peck-max-points", "0" if no_plunge else "1", *touch_args]
     if hmodel is not None or n_touches == 3:
         def record_touches(points):  # `out` (this run's folder) is set below, before the plunge calls this
             z_vision = [boardheight.vision_height(peg_raw_board, data["board_surface_z_m"], p) for p in points]
@@ -1155,8 +1540,12 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
         board_how = (f"3-point board plane at [{pts_str}] mm" if n_touches == 3 else
                      f"one board touch at [{pts_str}] mm on the height model's slope" if n_touches == 1 else
                      "the board height model's plane (no touch)")
-        print(f"plunge: position-controlled at the {'predicted' if z_hole_pred is not None else 'vision'} board "
-              f"({peck_board_z * 1e3:.2f} mm); not in: {board_how}, then up to {attempts} tilt search attempts")
+        if no_plunge:
+            print(f"no plunge (clearance {clearance_mm:g} mm <= insert.no_plunge_max_clearance_mm): {board_how}, then "
+                  f"up to {attempts} tilt search attempts")
+        else:
+            print(f"plunge: position-controlled at the {'predicted' if z_hole_pred is not None else 'vision'} board "
+                  f"({peck_board_z * 1e3:.2f} mm); not in: {board_how}, then up to {attempts} tilt search attempts")
     if method == "peck":
         print(f"peck search: position-controlled pecks about the vision hole ({' '.join(map(str, s.get('peck_options', [])))})")
     print(f"tilt search{' (not used)' if method == 'peck' else ''}: lead {lead['lead']} of {table_name}, slide {math.degrees(slide):+.1f} deg in base "
@@ -1165,6 +1554,10 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     if pattern == "lines":
         print(f"lines: {line['lines']} x {line['spacing_m'] * 1e3:.2f} mm ({lead_kind(lead)} lead), centred "
               f"{line['centre_m'] * 1e3:+.2f} mm across the slide from the hole")
+    if corner_in_note:
+        print(corner_in_note)
+    if slide_note:
+        print(slide_note)
     print(f"start: the tip {height_mm:g} mm above the vision board; " +
           ("one plunge, then the tilt search" if method == "plunge" else "one peck search" if method == "peck" else
            f"up to {attempts} attempts{', plunge first' if s.get('plunge', True) else ''}"))
@@ -1208,6 +1601,7 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
             "shape": shape, "hole_base_m": [float(v) for v in hole_base[:3]], "hole_yaw_base_deg": math.degrees(hole_yaw_base),
             "lead": lead, "lead_table": table_name, "slide_dir_base_deg": math.degrees(slide), "pattern": pattern,
             "line_plan": line,
+            "corner_in_m": in_hole_m,
             "start_height_mm": height_mm, "attempts": attempts, "tip_offset_tcp_mm": [float(v) * 1e3 for v in tool.tip_offset],
             "tip_source": tip_source, "settings": s, "method": method,
             "vision_hole_base_m": [float(v) for v in vision_base[:3]], "board_correction": correction,
@@ -1231,7 +1625,8 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
             seed = extract_ik_seed(probe_argv)
             t_z = float(hole_base[2]) + height_mm / 1000.0
             tr_z = float(hole_base[2]) + peg_travel if peg_travel is not None else None
-            if not move_to_hole(cfg, s, out, seed, "approach", travel_z=tr_z, target_z=t_z, tool=tool, dq=dq):
+            if not move_to_hole(cfg, s, out, seed, "approach", travel_z=tr_z, target_z=t_z, tool=tool, dq=dq,
+                                holding=True):
                 raise PipelineError("peg_search move to the hole failed")
         else:
             probe_argv = fast_probe_argv(cfg, s, probe_argv, out, clearance)
@@ -1267,7 +1662,9 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
     try:
         if method == "plunge":
             inserted = _plunge_then_tilt(cfg, s, out, drop_argv, common, summary, attempts, height_mm, hole_base,
-                                         touch_base, lead, error_m, grid, tool=tool, dq=dq, heights=heights_ctx)
+                                         touch_base, lead, error_m, grid, tool=tool, dq=dq, heights=heights_ctx,
+                                         plunge=not no_plunge, lead_candidates=candidates, start_in_hole_m=in_hole_m,
+                                         common_prefix=common_prefix, pattern=pattern, free_hole=free_hole)
         elif method == "peck":
             print("\n== peck search: position-controlled pecks about the vision hole ==", flush=True)
             code = peg_search(cfg, s, out, peck_argv)
@@ -1385,20 +1782,24 @@ def run(session, args, probe_target, restart_launch: bool = True, raise_on_fail:
                                            hole_yaw_base, board_sha, summary, hole_base, dq=dq)
                 if found is not None:
                     summary["found"] = found
-            # Up to the empty hand's travel height (insert.hand_travel_mm, where extract starts), else lift_m.
-            release_z = float(hole_base[2]) + hand_travel if hand_travel is not None else None
-            print(f"\n== release: open the hand to {s['release_width_mm']:g} mm, " +
-                  (f"up to the empty-hand travel height ({hand_travel * 1e3:g} mm over the board) =="
-                   if release_z is not None else f"lift {s['lift_m'] * 100:g} cm =="))
-            if not open_hand(cfg, s, out):
-                summary["stopped"] = "the hand did not open: not lifting (the peg is in the hole)"
-            elif not lift(cfg, s, out, float(s["lift_m"]), "lift_release", tool=tool, dq=dq, result=True,
-                          to_z=release_z):
-                summary["stopped"] = "the lift after the release failed"
-            summary["release"] = release_record(out / "lift_release.json", args.hole, shape, summary,
-                                                plane if method != "plunge" else summary.get("plane"),
-                                                hole_base, peck_board_z, tool, dq)
-        elif "stopped" not in summary or "lift" not in summary["stopped"]:
+            if summary.get("stopped"):
+                inserted = False
+            else:
+                # Up to the empty hand's travel height (insert.hand_travel_mm, where extract starts), else lift_m.
+                release_z = float(hole_base[2]) + hand_travel if hand_travel is not None else None
+                width = release_width_mm(s, tool, holes=holes, hole_name=args.hole)
+                print(f"\n== release: open the hand to {width:g} mm, " +
+                      (f"up to the empty-hand travel height ({hand_travel * 1e3:g} mm over the board) =="
+                       if release_z is not None else f"lift {s['lift_m'] * 100:g} cm =="))
+                if not open_hand(cfg, s, out, width):
+                    summary["stopped"] = "the hand did not open: not lifting (the peg is in the hole)"
+                elif not lift(cfg, s, out, float(s["lift_m"]), "lift_release", tool=tool, dq=dq, result=True,
+                              to_z=release_z):
+                    summary["stopped"] = "the lift after the release failed"
+                summary["release"] = release_record(out / "lift_release.json", args.hole, shape, summary,
+                                                    plane if method != "plunge" else summary.get("plane"),
+                                                    hole_base, peck_board_z, tool, dq)
+        if not inserted and ("stopped" not in summary or "lift" not in summary["stopped"]):
             end_z = float(hole_base[2]) + peg_travel if peg_travel is not None else None
             print("\n== not inserted: " + (f"up to the travel height with the peg ({peg_travel * 1e3:g} mm over the "
                                            "board) ==" if end_z is not None else f"lifting {s['lift_m'] * 100:g} cm with the peg =="))

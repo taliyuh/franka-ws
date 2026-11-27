@@ -34,7 +34,7 @@ def test_pipeline_yaml_speedup_defaults():
     assert s["peck_insert_depth_m"] == pytest.approx(0.010)
     assert s["centre_after_insert"] is True  # item 4 intentionally kept
     assert e["hover_mm"] == pytest.approx(6.0)
-    assert e["open_margin_mm"] == pytest.approx(7.0)
+    assert e["open_margin_mm"] == pytest.approx(4.5)
     assert e["speed_mm_s"] == pytest.approx(5.0)
     assert e["pull_speed_mm_s"] == pytest.approx(6.0)
     assert e["pull_stiffness"] == [150, 150, 4000, 70, 70, 2]
@@ -70,6 +70,8 @@ def test_robot_program_uses_docker_exec_when_persistent(monkeypatch, tmp_path):
 
     monkeypatch.setattr(insert, "robot_session_dir", lambda c, st: tmp_path)
     monkeypatch.setattr(insert, "ensure_robot_container", lambda c, st: "peg_search_robot")
+    from tests.conftest import REAL
+    monkeypatch.setattr(insert, "robot_program", REAL["robot_program"])  # itself, subprocess stubbed below
 
     def fake_run(cmd, **kwargs):
         seen.append(cmd)
@@ -108,6 +110,7 @@ def test_extract_ik_seed_and_move_to_hole(monkeypatch, tmp_path):
 
 def test_campaign_zero_handover_in_libfranka_travel(tmp_path, monkeypatch):
     """With travel=libfranka, campaign must not restart robot.launch between holes (only in finally)."""
+    monkeypatch.setattr(campaign, "rehome_gripper", lambda session, state, finished_round: None)
     start_calls = []
     extract_restart_flags = []
 
@@ -209,7 +212,7 @@ def test_extract_widens_open_width_on_high_grasp_failure(tmp_path, monkeypatch):
     import json
 
     cfg = Config.template()
-    assert cfg["extract"]["open_margin_mm"] == pytest.approx(7.0)
+    assert cfg["extract"]["open_margin_mm"] == pytest.approx(4.5)
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     session = SimpleNamespace(name="test", path=session_dir, cfg=cfg)
@@ -246,8 +249,8 @@ def test_extract_widens_open_width_on_high_grasp_failure(tmp_path, monkeypatch):
             "contact_above_board": -0.0205,
             "seated_shift_xy": [0.0, 0.0],
             "seated_turn_deg": 0.0,
-            "width": 0.0126,
-            "width_off": 0.0,
+            "width": 0.01135,
+            "width_off": -0.00125,  # the rectangle's normal (extract.grasp_gate)
             "pull_peak_lag_m": 0.002,
         }))
         return 0
@@ -255,13 +258,14 @@ def test_extract_widens_open_width_on_high_grasp_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(insert, "robot_session_dir", lambda c, st: tmp_path)
     monkeypatch.setattr(insert, "launch_running", lambda c, st: False)
     monkeypatch.setattr(insert, "peg_search", fake_peg_search)
-    monkeypatch.setattr(insert, "open_hand", lambda c, st, out_dir: True)
+    monkeypatch.setattr(insert, "open_hand", lambda c, st, out_dir, width_mm=None: True)
     monkeypatch.setattr(insert, "robot_program", lambda c, st, out_dir, prog, argv: 0)
 
     outcome = extract.run(session, args, None, record=record, here=True, restart_launch=False)
     assert outcome["ok"] is True
     assert outcome["attempts"] == 3
-    # rectangle grasp_width_mm = 12.679; initial margin 7 mm -> 26.679 mm, retry 1 -> +6 mm = 32.679 mm (capped at +20 mm = 32.679 mm)
-    assert open_widths_m[0] == pytest.approx(0.02668, abs=1e-5)
-    assert open_widths_m[1] == pytest.approx(0.03268, abs=1e-5)
-    assert open_widths_m[2] == pytest.approx(0.03268, abs=1e-5)
+    # rectangle grasp_width_mm = 15.660; open_margin 4.5 mm -> 24.660 mm, retry 1 -> +6 mm, capped at
+    # retry_max_open_margin 6 mm -> 27.660 mm
+    assert open_widths_m[0] == pytest.approx(0.02466, abs=1e-5)
+    assert open_widths_m[1] == pytest.approx(0.02766, abs=1e-5)
+    assert open_widths_m[2] == pytest.approx(0.02766, abs=1e-5)

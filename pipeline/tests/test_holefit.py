@@ -273,3 +273,68 @@ def test_full_matrix_matches_correct_xy_full():
     p = np.array([0.05, -0.03, 0.025, 1.0])
     moved = holefit.full_matrix(corr) @ (T @ p)
     assert moved[:2] == pytest.approx(holefit.correct_xy_full((T @ p)[:2], corr), abs=1e-12)
+
+
+def test_real_clustered_hexagon_touches_are_rejected_and_clean_touches_pass():
+    # 2026-11-25_204157 (hexagon_c3mm after tilt insert): 4/6 stopped within 0.3 mm, clustered on one side
+    bad_204157 = {
+        "ok": True,
+        "start_tip": [0.3910310909, 0.05196760661, -0.002779600001],
+        "touches": [
+            {"dir_deg": -119.67, "contact": True, "tip": [0.3903901482, 0.05030965134, -0.002700742828]},
+            {"dir_deg": -59.67, "contact": True, "tip": [0.3909587816, 0.05094346755, -0.003007441264]},
+            {"dir_deg": 0.33, "contact": True, "tip": [0.3909539946, 0.05167532821, -0.00300555603]},
+            {"dir_deg": 60.33, "contact": True, "tip": [0.3909823633, 0.05208695208, -0.00293436595]},
+            {"dir_deg": 120.33, "contact": True, "tip": [0.3909372667, 0.05204986725, -0.002849720798]},
+            {"dir_deg": -179.67, "contact": True, "tip": [0.3908508241, 0.05184121845, -0.002734968629]},
+        ],
+    }
+    assert holefit.found_from_touches(bad_204157, TABLE["hexagon_c3mm"]["free_m"], math.radians(-134.674),
+                                      [0.3927, 0.0523]) is None
+
+    # 2026-11-25_190923 (clean hexagon_c3mm) and 2026-11-25_191237 (clean round_c1mm)
+    good_190923 = {
+        "ok": True,
+        "start_tip": [0.3918659909, 0.05153685502, -0.002594129657],
+        "touches": [
+            {"dir_deg": -119.67, "contact": True, "tip": [0.3908986812, 0.05007286967, -0.002662902886]},
+            {"dir_deg": -59.67, "contact": True, "tip": [0.392706171, 0.0490786258, -0.002763190892]},
+            {"dir_deg": 0.33, "contact": True, "tip": [0.3944586919, 0.05136714876, -0.002873176737]},
+            {"dir_deg": 60.33, "contact": True, "tip": [0.3919544407, 0.05213457043, -0.002871823465]},
+            {"dir_deg": 120.33, "contact": True, "tip": [0.3914323062, 0.05195763777, -0.002807374369]},
+            {"dir_deg": -179.67, "contact": True, "tip": [0.3912892111, 0.05156777539, -0.002745862899]},
+        ],
+    }
+    res_hex = holefit.found_from_touches(good_190923, TABLE["hexagon_c3mm"]["free_m"], math.radians(-134.674),
+                                         [0.3927, 0.0523])
+    assert res_hex is not None and res_hex["xy"] == pytest.approx([0.392736, 0.050690], abs=1e-4)
+
+    good_191237 = {
+        "ok": True,
+        "start_tip": [0.4482595157, 0.1111810979, -0.003216725132],
+        "touches": [
+            {"dir_deg": -74.66, "contact": True, "tip": [0.4483306033, 0.1107425916, -0.003231071322]},
+            {"dir_deg": -14.66, "contact": True, "tip": [0.4489607501, 0.1108990425, -0.003343965335]},
+            {"dir_deg": 45.34, "contact": False, "tip": [0.4488574547, 0.1118744593, -0.00335735678]},
+            {"dir_deg": 105.34, "contact": True, "tip": [0.447937155, 0.1116569809, -0.003468528167]},
+            {"dir_deg": 165.34, "contact": True, "tip": [0.4478527211, 0.1112919251, -0.003285559724]},
+            {"dir_deg": -134.66, "contact": True, "tip": [0.4479280508, 0.1110216206, -0.00325931412]},
+        ],
+    }
+    res_rnd = holefit.found_from_touches(good_191237, TABLE["round_c1mm"]["free_m"], math.radians(-89.662),
+                                         [0.4487, 0.1128])
+    assert res_rnd is not None and res_rnd["xy"] == pytest.approx([0.448496, 0.111351], abs=1e-4)
+
+
+def test_fit_correction_clamps_bogus_large_turn():
+    # Two noisy holes 67 mm apart giving a ~2.1 deg turn -> clamped to shift-only
+    entries = [
+        {"hole": "hexagon_c3mm", "vision_xy": [0.3927, 0.0523], "found_xy": [0.3903, 0.0507],
+         "sigma_m": 1e-4, "board_sha256": BOARD, "run": "r1"},
+        {"hole": "triangle_c3mm", "vision_xy": [0.3932, -0.0153], "found_xy": [0.3932, -0.0153],
+         "sigma_m": 1e-4, "board_sha256": BOARD, "run": "r2"},
+    ]
+    corr = holefit.fit_correction(entries, BOARD)
+    assert corr["turn_clamped"] is True
+    assert corr["turn_deg"] == pytest.approx(0.0)
+    assert corr["shift_m"][0] == pytest.approx(-0.0012, abs=1e-4)

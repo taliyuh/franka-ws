@@ -44,7 +44,9 @@ SURFACE_Z = 0.025          # board top surface, board frame (holes.yaml surface_
 # Joint 7 must stay this far inside its +-2.8973 rad limits at the hole: the
 # guarded descent and the Cartesian corrections move it a little, and at
 # -2.85 rad the robot stopped with joint_motion_generator_position_limits_violation.
-WRIST_MARGIN_RAD = 0.35
+# 0.25 rad (~14.3 deg): keeps l_shape_c1mm (0.30 rad margin) at arm angle 0 while
+# still triggering the elbow fallback on l_shape_c3mm (0.11 rad margin).
+WRIST_MARGIN_RAD = 0.25
 ROUND_STEP_DEG = 10.0      # the round peg may turn by any angle; candidates this far apart
 # Elbow fallback (choose_turn): when no peg turn keeps joint 7 WRIST_MARGIN_RAD inside its limits with the elbow
 # arm angle at 0 (the L: one turn only), the elbow is turned, smallest first, in these steps up to the maximum.
@@ -397,3 +399,150 @@ def resolve_tip(tool: Tool, tip_from: str | None, session_path: Path | None, hos
             tool, source = apply_pivot_tip(tool, load_pivot_tip(path))
             return tool, f"{source}, the session's tips/{path.name}"
     return tool, "CAD"
+
+
+# ----------------------------------------------------------------- neighbor clearance (v3 fingers)
+# Lower grip section (Z = 34..54 mm, the part that descends below peg tops) in hand/TCP axes, mm:
+#   Finger A (V-block, +Y): x in [-16.8, +16.8], y in [q, q + 30.0]
+#   Finger B (pusher,  -Y): x in [-10.0, +10.0], y in [-(q + 30.0), -q + 10.0]   (q = width / 2)
+FINGER_A_HALF_X_MM = 16.8
+FINGER_A_DEPTH_MM = 30.0
+FINGER_B_HALF_X_MM = 10.0
+FINGER_B_DEPTH_MM = 30.0
+FINGER_B_TONGUE_MM = 10.0
+
+# Neighbor peg 2D footprints in each hole's own frame (mm; x = outward normal of longest flat).
+# Exact convex polygons for rectangle (16x12) and hexagon (17 AF); circumcircles for the rest.
+_RECT_POLY_MM = np.array([[-6.0, -8.0], [6.0, -8.0], [6.0, 8.0], [-6.0, 8.0]], dtype=float)
+_HEX_R_MM = 17.0 / math.sqrt(3.0)
+_HEX_POLY_MM = np.array(
+    [[_HEX_R_MM * math.cos(math.radians(30.0 + 60.0 * k)),
+      _HEX_R_MM * math.sin(math.radians(30.0 + 60.0 * k))] for k in range(6)],
+    dtype=float,
+)
+_PEG_RADIUS_MM = {"round": 6.0, "hexagon": _HEX_R_MM, "triangle": 12.0, "rectangle": 10.0, "l_shape": 14.0}
+_PEG_POLYS_MM = {"rectangle": _RECT_POLY_MM, "hexagon": _HEX_POLY_MM}
+
+
+def _rect_point_dist(px: float, py: float, xmin: float, xmax: float, ymin: float, ymax: float) -> float:
+    dx = max(xmin - px, 0.0, px - xmax)
+    dy = max(ymin - py, 0.0, py - ymax)
+    if dx == 0.0 and dy == 0.0:
+        return -min(px - xmin, xmax - px, py - ymin, ymax - py)
+    return math.hypot(dx, dy)
+
+
+def _point_in_convex_ccw(p: np.ndarray, poly: np.ndarray) -> bool:
+    for i in range(len(poly)):
+        a, b = poly[i], poly[(i + 1) % len(poly)]
+        if (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) < -1e-9:
+            return False
+    return True
+
+
+def _seg_point_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    t = 0.0 if denom <= 1e-12 else max(0.0, min(1.0, float(np.dot(p - a, ab) / denom)))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def _seg_intersect(a1: np.ndarray, a2: np.ndarray, b1: np.ndarray, b2: np.ndarray) -> bool:
+    def cross(u, v):
+        return u[0] * v[1] - u[1] * v[0]
+    d1, d2 = a2 - a1, b2 - b1
+    denom = cross(d1, d2)
+    if abs(denom) < 1e-12:
+        return False
+    t = cross(b1 - a1, d2) / denom
+    u = cross(b1 - a1, d1) / denom
+    return 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0
+
+
+def _convex_poly_dist(p_poly: np.ndarray, q_poly: np.ndarray) -> float:
+    """Distance between two CCW convex 2D polygons (0.0 if overlapping)."""
+    for p in p_poly:
+        if _point_in_convex_ccw(p, q_poly):
+            return 0.0
+    for q in q_poly:
+        if _point_in_convex_ccw(q, p_poly):
+            return 0.0
+    for i in range(len(p_poly)):
+        a1, a2 = p_poly[i], p_poly[(i + 1) % len(p_poly)]
+        for j in range(len(q_poly)):
+            if _seg_intersect(a1, a2, q_poly[j], q_poly[(j + 1) % len(q_poly)]):
+                return 0.0
+    best = math.inf
+    for p in p_poly:
+        for j in range(len(q_poly)):
+            best = min(best, _seg_point_dist(p, q_poly[j], q_poly[(j + 1) % len(q_poly)]))
+    for q in q_poly:
+        for i in range(len(p_poly)):
+            best = min(best, _seg_point_dist(q, p_poly[i], p_poly[(i + 1) % len(p_poly)]))
+    return best
+
+
+def neighbor_clearance_mm(tool: Tool, holes: dict, hole_name: str, width_mm: float) -> tuple[float, str | None]:
+    """Minimum 2D clearance (mm) between the v3 fingers opened to `width_mm` over `hole_name` and every other-shape
+    hole on the board (assuming a peg may sit in any other shape's hole; same-shape holes share one physical peg)."""
+    target_shape = getattr(tool, "shape", None) or (holes.get(hole_name) or {}).get("shape")
+    p_tcp_b = (np.asarray(tool.point, float)[:2] - (np.asarray(tool.rotation, float) @ np.asarray(tool.tip_offset, float))[:2]) * 1e3
+    ex_h = np.asarray(tool.rotation, float)[:2, 0]
+    ey_h = np.asarray(tool.rotation, float)[:2, 1]
+    q = float(width_mm) / 2.0
+    finger_a = np.array([[-FINGER_A_HALF_X_MM, q], [FINGER_A_HALF_X_MM, q],
+                         [FINGER_A_HALF_X_MM, q + FINGER_A_DEPTH_MM], [-FINGER_A_HALF_X_MM, q + FINGER_A_DEPTH_MM]])
+    finger_b = np.array([[-FINGER_B_HALF_X_MM, -(q + FINGER_B_DEPTH_MM)], [FINGER_B_HALF_X_MM, -(q + FINGER_B_DEPTH_MM)],
+                         [FINGER_B_HALF_X_MM, -q + FINGER_B_TONGUE_MM], [-FINGER_B_HALF_X_MM, -q + FINGER_B_TONGUE_MM]])
+
+    worst_d, worst_name = math.inf, None
+    for other_name, h2 in holes.items():
+        if other_name == hole_name or h2.get("shape") == target_shape:
+            continue
+        p2_b = np.array([float(h2["x_m"]), float(h2["y_m"])]) * 1e3
+        shape2 = h2.get("shape", "")
+        poly2 = _PEG_POLYS_MM.get(shape2)
+        if poly2 is not None:
+            r2 = _rz(math.radians(float(h2.get("yaw_deg", 0.0))))[:2, :2]
+            corners_b = p2_b + (r2 @ poly2.T).T
+            dp = corners_b - p_tcp_b
+            corners_h = np.column_stack([dp @ ex_h, dp @ ey_h])
+            d = min(_convex_poly_dist(finger_a, corners_h), _convex_poly_dist(finger_b, corners_h))
+        else:
+            dp = p2_b - p_tcp_b
+            xh, yh = float(np.dot(dp, ex_h)), float(np.dot(dp, ey_h))
+            rad = _PEG_RADIUS_MM.get(shape2, 12.0)
+            d_a = _rect_point_dist(xh, yh, -FINGER_A_HALF_X_MM, FINGER_A_HALF_X_MM, q, q + FINGER_A_DEPTH_MM) - rad
+            d_b = _rect_point_dist(xh, yh, -FINGER_B_HALF_X_MM, FINGER_B_HALF_X_MM, -(q + FINGER_B_DEPTH_MM), -q + FINGER_B_TONGUE_MM) - rad
+            d = min(d_a, d_b)
+        if d < worst_d:
+            worst_d, worst_name = d, other_name
+    return float(worst_d), worst_name
+
+
+def safe_open_width_mm(tool, holes: dict | None, hole_name: str | None, requested_mm: float,
+                       min_clearance_mm: float | None = 2.5,
+                       min_width_mm: float | None = None) -> tuple[float, str | None, float | None]:
+    """Cap `requested_mm` so both v3 fingers keep at least `min_clearance_mm` from every other-shape hole on the board.
+    Returns `(width_mm, capped_by_hole_or_None, clearance_mm_or_None)`. Never caps below `min_width_mm`."""
+    req = float(requested_mm)
+    if (min_clearance_mm is None or float(min_clearance_mm) <= 0.0 or not holes or not hole_name
+            or tool is None or not all(hasattr(tool, a) for a in ("point", "rotation", "tip_offset"))):
+        return req, None, None
+    target_clear = float(min_clearance_mm)
+    clear_req, nearest = neighbor_clearance_mm(tool, holes, hole_name, req)
+    if nearest is None or clear_req >= target_clear:
+        return req, None, clear_req
+    lo = req if min_width_mm is None else min(req, float(min_width_mm))
+    clear_lo, nearest_lo = neighbor_clearance_mm(tool, holes, hole_name, lo)
+    if clear_lo < target_clear:
+        return lo, nearest_lo, clear_lo
+    hi = req
+    for _ in range(20):
+        mid = 0.5 * (lo + hi)
+        if neighbor_clearance_mm(tool, holes, hole_name, mid)[0] >= target_clear:
+            lo = mid
+        else:
+            hi = mid
+    clear_cap, nearest_cap = neighbor_clearance_mm(tool, holes, hole_name, lo)
+    return round(lo, 2), nearest_cap, clear_cap

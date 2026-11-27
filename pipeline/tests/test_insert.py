@@ -678,3 +678,257 @@ def test_plunge_flow_with_the_grid(tmp_path, monkeypatch):
         assert all(abs(after[0] - m) > 0.5 * spacing for m in before[:2]), tried
     assert all(a_["grid_plan"] is not None for a_ in summary["attempts"][1:])
     assert (tmp_path / "grid_1.npz").exists()
+
+
+def test_zero_contact_centre_aborts_release_and_keeps_peg_in_hand(tmp_path, monkeypatch):
+    """2026-11-25 21:32 hexagon_c1mm scenario: peck claimed inserted, centre got 0/6 wall contacts."""
+    session_dir = tmp_path / "session"
+    (session_dir / "targets").mkdir(parents=True)
+    board = np.eye(4)
+    board[:3, 3] = [0.45, 0.05, -0.0185]
+    target = session_dir / "targets" / "hexagon_c1mm.json"
+    target.write_text(json.dumps({"T_base_board": board.tolist(), "board_surface_z_m": 0.025,
+                                  "source": {"board_pose_sha256": "sha-z"}}))
+
+    def probe_target(session, holes, name, tip_from, height_mm, turn, joint_correction=True):
+        return _tool(), "CAD", target, ["--board-pose", "/franka_ws/x.json", "--ik-seed", 0, 0, 0, -2, 0, 2, 0]
+
+    lifts, opens = [], []
+
+    def fake_peg_search(cfg, s, out, argv):
+        argv = list(map(str, argv))
+        if argv[1] == "peck":
+            (out / "peck.json").write_text(json.dumps({
+                "ok": True, "stage": "done", "inserted": True, "method": "peck",
+                "inserted_xy": [0.45, 0.05], "end_tip": [0.45, 0.05, -0.008],
+            }))
+        elif argv[1] == "centre":
+            (out / "centre.json").write_text(json.dumps({
+                "ok": True, "stage": "done", "contacts": 0,
+                "touches": [{"dir_deg": k * 60.0, "contact": False, "tip": [0.45, 0.05, -0.008]} for k in range(6)],
+            }))
+        return 0
+
+    monkeypatch.setattr(insert, "robot_session_dir", lambda c, st: tmp_path)
+    monkeypatch.setattr(insert, "launch_running", lambda c, st: False)
+    monkeypatch.setattr(insert, "move_to_hole", lambda *a, **k: True)
+    monkeypatch.setattr(insert, "peg_search", fake_peg_search)
+    monkeypatch.setattr(insert, "open_hand", lambda *a, **k: opens.append(True) or True)
+    monkeypatch.setattr(insert, "lift", lambda c, s, out, d, name, **k: lifts.append(name) or True)
+
+    cfg = Config(dict(Config.template().data))
+    session = SimpleNamespace(cfg=cfg, path=session_dir, name="t")
+    args = SimpleNamespace(hole="hexagon_c1mm", attempts=None, height=None, tip_from=None, turn=0.0,
+                           no_joint_correction=True, slide_dir=None, pattern=None, method="plunge", here=False,
+                           dry_run=False, no_board_correction=True, no_centre=False, search=None, touches="0")
+    out = insert.run(session, args, probe_target, restart_launch=False, raise_on_fail=False)
+    assert out["inserted"] is False
+    assert "wall contacts" in out["stopped"]
+    assert not opens
+    assert lifts == ["lift_end"]
+    assert holefit.load_found(session_dir) == []
+
+
+def test_correction_entries_excludes_loose_tilt_seats_but_keeps_tight():
+    entries = [
+        {"hole": "round_c1mm", "source": "wall touches (6)"},
+        {"hole": "round_c3mm", "source": "seated tip (tilt, end_tip)"},
+        {"hole": "round_c0p2mm", "source": "seated tip (tilt, end_tip)"},
+        {"hole": "hexagon_c0p2mm", "source": "seated tip (inserted_xy)"},
+        {"hole": "l_shape_c0p2mm", "source": "seated tip (tilt, end_tip)"},
+    ]
+    kept = insert.correction_entries(entries, S, HOLES)
+    assert [e["hole"] for e in kept] == ["round_c1mm", "round_c0p2mm", "hexagon_c0p2mm"]
+
+
+def test_tilt_inserted_wall_touches_are_downweighted(tmp_path, monkeypatch):
+    hole, yaw = "hexagon_c1mm", 0.4
+    truth = np.array([0.4520, -0.0163])
+    rng = np.random.default_rng(12)
+    seat, touches = simulate_touches(hole, truth, yaw, rng)
+
+    def fake(cfg, s, out, argv):
+        (out / "centre.json").write_text(json.dumps({"ok": True, "stage": "done", "contacts": 6, "touches": touches}))
+        return 0
+
+    monkeypatch.setattr(insert, "peg_search", fake)
+    session = SimpleNamespace(path=tmp_path)
+    out = tmp_path / "insert" / "run_tilt_wt"
+    out.mkdir(parents=True)
+    summary = {"inserted_by": {"inserted": True, "end_tip": [*seat, -0.008], "outcomes": ["inserted"], "plunge": "none"}}
+    entry = insert._centre_and_record(None, S, out, session, SimpleNamespace(hole=hole, no_centre=False), _tool(),
+                                      TABLE[hole], HOLES, hole, np.array([0.4525, -0.0166, 0.0065]), yaw, "sha",
+                                      summary, np.array([0.4525, -0.0166, 0.0065]))
+    assert entry["source"].startswith("wall touches (tilt")
+    assert entry["sigma_m"] >= 0.0008
+
+
+def test_corner_in_default_every_shape_but_round_every_clearance():
+    s = Config.template()["insert"]
+    assert s["corner_in"] == "auto" and s["corner_in_min_found_holes"] == 0
+    assert s["corner_in_max_clearance_mm"] is None
+    for hole in TABLE:
+        shape, clr = HOLES[hole]["shape"], float(HOLES[hole]["clearance_mm"])
+        for lead in TABLE[hole]["leads"]:
+            depth = insert.corner_in_depth(lead, s, clr, 0, shape=shape)
+            if shape == "round":
+                assert depth is None, hole
+                continue
+            assert depth is not None and 0.0 < depth <= lead["near_m"] + lead["along_m"][0] + 1e-12, hole
+    # the robot-tested tight depths are unchanged by the dip cap
+    assert insert.corner_in_depth(lead_of("triangle_c0p2mm"), s, 0.2, 0, shape="triangle") == \
+        pytest.approx(0.55 * 0.0051, abs=1e-5)
+    assert insert.corner_in_depth(lead_of("rectangle_c0p2mm"), s, 0.2, 0, shape="rectangle") == pytest.approx(0.0045)
+    assert insert.corner_in_depth(lead_of("hexagon_c0p03mm"), s, 0.03, 0, shape="hexagon") == pytest.approx(0.0045)
+    # loose holes: at most where the lead dips (0.55 near is past it)
+    tri3 = lead_of("triangle_c3mm")
+    assert insert.corner_in_depth(tri3, s, 3.0, 0, shape="triangle") == pytest.approx(tri3["near_m"] + tri3["along_m"][0])
+    assert insert.corner_in_depth(tri3, {**s, "corner_in_dip_cap": False}, 3.0, 0, shape="triangle") == \
+        pytest.approx(0.55 * tri3["near_m"])
+
+
+def test_corner_in_modes_and_gates():
+    # the earlier gated config: triangle only, at most 0.2 mm, 2 found holes
+    s = {**Config.template()["insert"], "corner_in_shapes": ["triangle"], "corner_in_max_clearance_mm": 0.2,
+         "corner_in_min_found_holes": 2}
+    tri, rect, ell = lead_of("triangle_c0p03mm"), lead_of("rectangle_c0p03mm"), lead_of("l_shape_c0p03mm", 1)
+    hexa = lead_of("hexagon_c0p03mm")
+    assert insert.corner_in_depth(tri, s, 0.03, 2, shape="triangle") == pytest.approx(0.55 * 0.00502, abs=1e-5)
+    depth, note = insert.corner_in_plan(rect, s, 0.03, 5, shape="rectangle")
+    assert depth is None and "--corner-in on" in note
+    assert insert.corner_in_depth(ell, s, 0.03, 5, shape="l_shape") is None
+    depth, note = insert.corner_in_plan(tri, s, 0.03, 0, shape="triangle")
+    assert depth is None and "0 < 2 found holes" in note
+    assert insert.corner_in_depth(lead_of("triangle_c1mm"), s, 1.0, 5, shape="triangle", mode="on") is None
+    # on: any corner / edge shape, without the found-hole gate
+    depth, note = insert.corner_in_plan(rect, s, 0.03, 0, shape="rectangle", mode="on")
+    assert depth == pytest.approx(0.0045) and "rectangle not in" in note and "0 < 2" in note
+    assert insert.corner_in_depth(ell, s, 0.03, 0, shape="l_shape", mode="on") == pytest.approx(0.0045)
+    depth, note = insert.corner_in_plan(hexa, s, 0.03, 5, shape="hexagon")
+    assert depth is None and note.startswith("edge-in: not by default")
+    depth, note = insert.corner_in_plan(hexa, s, 0.03, 0, shape="hexagon", mode="on")
+    assert depth == pytest.approx(0.0045) and note.startswith("edge-in: starting lead 4.50 mm")
+    # never round, never a flat lead without its shape
+    s = Config.template()["insert"]
+    assert insert.corner_in_depth(hexa, s, 0.03, 5, shape=None, mode="on") is None
+    assert insert.corner_in_depth(lead_of("round_c0p03mm"), s, 0.03, 5, shape="round", mode="on") is None
+    assert insert.corner_in_depth(lead_of("round_c0p03mm"), {**s, "corner_in_edge_shapes": ["round"]}, 0.03, 5,
+                                  shape="round", mode="on") is None
+    # off: never, even with a hole override's start_in_hole_m
+    assert insert.corner_in_depth(tri, s, 0.03, 5, shape="triangle", mode="off") is None
+    assert insert.corner_in_depth(tri, {**s, "start_in_hole_m": 0.003}, 0.03, 5, shape="triangle", mode="off") is None
+    assert insert.corner_in_depth(rect, {**s, "start_in_hole_m": 0.003}, 0.03, 0, shape="rectangle") == 0.003
+    assert insert.corner_in_depth(rect, {**s, "corner_in": "off"}, 0.03, 0, shape="rectangle") is None
+    with pytest.raises(PipelineError):
+        insert.corner_in_plan(tri, s, 0.03, 5, mode="always")
+
+
+# an approach pose over the board (2026-11-27_111834, triangle_c0p03mm) and the round peg's CAD tip
+ROUND_SEED = [-0.07710, 0.47880, -0.00272, -2.23195, -0.01022, 2.72009, -1.09388]
+ROUND_TIP = [0.0, 0.0125, 0.039]
+
+
+def _round_lead():
+    entry = TABLE["round_c0p2mm"]
+    return insert.sized_lead(entry["leads"][0], float(entry["error_m"]), 0.002, lag_margin_m=0.004)
+
+
+def _hole_under(seed):
+    from board_pipeline import panda
+    t = panda.fk(np.asarray(seed), "panda_hand_tcp")
+    p = t[:3, :3] @ np.asarray(ROUND_TIP) + t[:3, 3]
+    return np.array([p[0], p[1], p[2] - 0.006])
+
+
+def test_round_slide_random_and_reachable():
+    pytest.importorskip("cv2")
+    s = Config.template()["insert"]
+    assert s["round_slide_random"] is True
+    lead, hole = _round_lead(), _hole_under(ROUND_SEED)
+    assert insert.slide_reachable(ROUND_SEED, ROUND_TIP, hole, lead, math.radians(90.0), s, 0.002) is None
+    rng = np.random.default_rng(7)
+    slides = []
+    for _ in range(4):
+        slide, note = insert.random_round_slide(ROUND_SEED, ROUND_TIP, hole, lead, math.radians(90.0), s, 0.002, rng)
+        assert note.startswith("round slide: random")
+        assert insert.slide_reachable(ROUND_SEED, ROUND_TIP, hole, lead, slide, s, 0.002) is None
+        slides.append(slide)
+    assert np.ptp(slides) > math.radians(20.0)
+
+
+def test_round_slide_keeps_joints_inside_limits():
+    pytest.importorskip("cv2")
+    s = Config.template()["insert"]
+    lead = _round_lead()
+    near_limit = [*ROUND_SEED[:6], 2.85]  # joint 7 0.05 rad from its limit: no direction keeps 0.1 rad
+    hole = _hole_under(near_limit)
+    why = insert.slide_reachable(near_limit, ROUND_TIP, hole, lead, 0.0, s, 0.002)
+    assert why is not None and why.startswith("joint 7")
+    slide, note = insert.random_round_slide(near_limit, ROUND_TIP, hole, lead, math.radians(90.0), s, 0.002,
+                                            np.random.default_rng(1))
+    assert slide == pytest.approx(math.radians(90.0)) and "none of 12" in note
+    slide, note = insert.random_round_slide(None, ROUND_TIP, hole, lead, math.radians(90.0), s, 0.002)
+    assert slide == pytest.approx(math.radians(90.0)) and "no approach joint angles" in note
+
+
+def test_sized_lead_and_corner_in_lead_include_lag_margin():
+    lead = lead_of("l_shape_c1mm", 1)
+    sized = insert.sized_lead(lead, 0.005, 0.002, lag_margin_m=0.004)
+    assert sized["slide_length_m"] == pytest.approx(lead["slide_length_m"] - 0.006 + 0.004)
+    s = {**Config.template()["insert"], "slide_lag_margin_m": 0.004}
+    ci = insert.corner_in_lead(lead_of("triangle_c0p2mm"), s, start_in_hole_m=0.0028)
+    assert ci["lead_run_up_m"] == pytest.approx(0.0051 - 0.0028)
+    assert ci["slide_length_m"] == pytest.approx((0.0051 - 0.0028) + 0.0092 + 0.001 + 0.004)
+    # Concave L-shape: dip_region_m on the centre line opens past the hole centre (~+2.93..+7.39 mm),
+    # so corner_in_lead starts inside that pocket (negative lead_run_up_m) rather than 7 mm before the hole.
+    l_lead = lead_of("l_shape_c0p2mm", 1)
+    sl = insert.dip_slice_along(l_lead)
+    assert sl is not None and sl[0] > 0.002 and sl[1] > sl[0] + 0.004
+    l_ci = insert.corner_in_lead(l_lead, s, start_in_hole_m=0.0045)
+    assert l_ci["lead_run_up_m"] == pytest.approx(-(sl[0] + 0.5 * (sl[1] - sl[0])))
+    assert l_ci["lead_run_up_m"] < -0.004 and l_ci["slide_length_m"] > 0.008
+
+
+def test_shallow_rotates_lead_and_stops_after_two_attempts(tmp_path, monkeypatch, capsys):
+    s = Config.template()["insert"]
+    entry = TABLE["triangle_c0p2mm"]
+    candidates = [(insert.sized_lead(l, float(entry["error_m"]), 0.002, lag_margin_m=0.004), sl)
+                  for l, sl in insert.ordered_leads(entry, 0.0, 90.0, s, 0.002)]
+    assert len(candidates) >= 2 and candidates[0][1] != candidates[1][1]
+
+    seen_dirs = []
+
+    def fake(cfg, st, out, argv):
+        argv = list(map(str, argv))
+        if argv[1] == "peck":
+            (out / "peck.json").write_text(json.dumps({
+                "ok": True, "stage": "done", "inserted": False, "board_measured": 0.0065,
+                "first": {"xy": [0.5, -0.015], "tip_z": None, "result": "none"},
+            }))
+        else:
+            seen_dirs.append(float(argv[argv.index("--slide-dir-deg") + 1]))
+            res_name = Path(argv[argv.index("--result") + 1]).name
+            (out / res_name).write_text(json.dumps({
+                "ok": True, "stage": "done", "inserted": False, "outcomes": ["shallow"],
+                "slide_dir": [0.0, 1.0],
+            }))
+        return 0
+
+    monkeypatch.setattr(insert, "peg_search", fake)
+    monkeypatch.setattr(insert, "robot_program", lambda *a, **k: 0)
+    lead, slide = candidates[0]
+    prefix = ["--hole-xy", "0.5", "-0.015", "--board-z", "0.0065", "--lift-at-end", "--yes"]
+    common = [*prefix, *map(str, insert.search_args(lead, slide, s, "lines", 0.002))]
+    summary = {"attempts": [], "inserted": False}
+    ok = insert._plunge_then_tilt(
+        None, s, tmp_path, ["ip", "peck", "/insert/peck.csv", "--result", "/insert/peck.json"],
+        common, summary, 5, 6.0, np.array([0.5, -0.015, 0.0065]), np.array([0.48, -0.015, 0.0065]),
+        lead, 0.002, plunge=False, lead_candidates=candidates, common_prefix=prefix, pattern="lines",
+        free_hole=entry["free_m"],
+    )
+    out = capsys.readouterr().out
+    assert ok is False
+    assert len(seen_dirs) == 2
+    assert seen_dirs[0] != seen_dirs[1]
+    assert "switching to symmetric lead" in out
+    assert "stopping after 2 shallow attempts" in out

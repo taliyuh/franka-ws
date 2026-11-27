@@ -75,7 +75,46 @@ def test_unreachable_l_hole_turns_the_elbow(board):
 def test_reachable_hole_keeps_the_elbow_at_zero(board):
     pytest.importorskip("cv2")
     from board_pipeline import grasp
-    for name in ("l_shape_c0p2mm", "hexagon_c3mm"):
+    for name in ("l_shape_c0p2mm", "l_shape_c1mm", "hexagon_c3mm"):
         tool, _ = grasp.choose_turn(Config.template(), HOLES[name], name, board)
         assert tool.arm_angle == 0.0, name
         assert grasp.at_arm_angle(tool.joints, 0.0), name
+
+
+def test_same_hole_elbow_correction_matches_hole_angle_and_tip(tmp_path):
+    tip_v3 = [0.003459, 0.012303, 0.039]
+    tip_cad = [0.004491, 0.012479, 0.039]
+    vision = [0.3934, -0.1348]
+    # Legacy entry without tip_in_tcp_m (must be ignored when tip_offset is provided)
+    holefit.record_found(tmp_path, "l_shape_c3mm", vision, {"xy": [0.3922, -0.1371], "sigma_m": 0.001, "source": "s"},
+                         "sha", "r0", arm_angle_deg=-5.0)
+    # Entry with different tip (must be ignored)
+    holefit.record_found(tmp_path, "l_shape_c3mm", vision, {"xy": [0.3922, -0.1371], "sigma_m": 0.001, "source": "s"},
+                         "sha", "r1", arm_angle_deg=-5.0, tip_offset=tip_cad)
+    # Entry with matching tip and arm angle
+    holefit.record_found(tmp_path, "l_shape_c3mm", vision, {"xy": [0.3930, -0.1364], "sigma_m": 0.0005, "source": "s"},
+                         "sha", "r2", arm_angle_deg=-5.0, tip_offset=tip_v3)
+    # Entry at different arm angle (must be ignored)
+    holefit.record_found(tmp_path, "l_shape_c3mm", vision, {"xy": [0.3950, -0.1340], "sigma_m": 0.0005, "source": "s"},
+                         "sha", "r3", arm_angle_deg=0.0, tip_offset=tip_v3)
+    entries = holefit.load_found(tmp_path)
+    corr = holefit.same_hole_elbow_correction(entries, "l_shape_c3mm", "sha", -5.0, tip_offset=tip_v3)
+    assert corr is not None and corr["holes"] == 1 and corr["elbow_same_hole"] is True
+    shifted = holefit.correct_xy_full(vision, corr)
+    assert shifted == pytest.approx([0.3930, -0.1364], abs=1e-4)
+    M = holefit.full_matrix(corr)
+    assert (M @ np.array([vision[0], vision[1], 0.0, 1.0]))[:2] == pytest.approx(shifted, abs=1e-9)
+    assert holefit.same_hole_elbow_correction(entries, "l_shape_c3mm", "sha", -10.0, tip_offset=tip_v3) is None
+
+
+def test_session_l_shape_tip_resolves():
+    pytest.importorskip("cv2")
+    from board_pipeline import grasp
+    session_path = BOARD.parent
+    tip_file = grasp.session_tip_path(session_path, "l_shape")
+    if not tip_file.exists():
+        pytest.skip(f"no {tip_file}")
+    base_tool = grasp.hole_tool(Config.template(), HOLES["l_shape_c3mm"], "l_shape_c3mm")
+    resolved, source = grasp.resolve_tip(base_tool, None, session_path)
+    assert "tips/l_shape.yaml" in source
+    assert resolved.tip_offset == pytest.approx([0.003459, 0.012303, 0.039], abs=1e-6)

@@ -142,6 +142,8 @@ def setup(tmp_path, monkeypatch):
         monkeypatch.setattr(insert, "start_launch", lambda cfg, s: None)
         monkeypatch.setattr(insert, "stop_launch", lambda cfg, s: None)
         monkeypatch.setattr(insert, "launch_running", lambda cfg, s: False)
+        monkeypatch.setattr(campaign, "rehome_gripper",
+                            lambda session, state, finished_round: robot.calls.append(("rehome", finished_round)))
         session = SimpleNamespace(path=tmp_path / "session", cfg=Config.template())
         c = Config.template()["campaign"]
         campaign.save_state(session, campaign.new_state(HOLES, c, rounds, list(shapes)))
@@ -303,3 +305,43 @@ def test_no_board_correction_holes_setting(setup):
     for h, flag in by_hole.items():
         if h != "l_shape_c3mm":
             assert flag is False, f"expected no_board_correction=False for {h}"
+
+
+def test_the_gripper_is_rehomed_after_each_completed_board(setup):
+    session, robot = setup(shapes=("round",), rounds=2)
+    campaign.cmd_run(session, SimpleNamespace(dry_run=False, max_inserts=None), None)
+    rehomes = [c for c in robot.calls if c[0] == "rehome"]
+    assert rehomes == [("rehome", 1), ("rehome", 2)]
+    # right after each round's last insert
+    i = robot.calls.index(("rehome", 1))
+    assert robot.calls[i - 1] == ("insert", "round_c0p2mm")
+
+
+def test_rehome_lifts_then_homes_and_skips_with_a_peg_in_the_hand(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(insert, "lift", lambda cfg, s, out, d, name, **k: seen.append(("lift", d, name)) or True)
+    monkeypatch.setattr(insert, "robot_program", lambda cfg, s, out, prog, argv: seen.append((prog, argv[1])) or 0)
+    monkeypatch.setattr(insert, "gripper_state", lambda cfg, s: {"width": 0.0792, "grasped": False})
+    session = SimpleNamespace(path=tmp_path / "session", cfg=Config.template())
+    state = campaign.new_state(HOLES, Config.template()["campaign"], 2, ["round"])
+    campaign.rehome_gripper(session, state, 1)
+    assert seen == [("lift", 0.06, "rehome_lift"), ("gripper", "home")]
+    seen.clear()
+    state["pegs"]["round"]["at"] = "hand"
+    campaign.rehome_gripper(session, state, 1)
+    assert seen == []                                      # homing would open the hand
+
+
+def test_a_failed_homing_stops_the_campaign(tmp_path, monkeypatch):
+    monkeypatch.setattr(insert, "lift", lambda *a, **k: True)
+    monkeypatch.setattr(insert, "robot_program", lambda *a, **k: 1)
+    session = SimpleNamespace(path=tmp_path / "session", cfg=Config.template())
+    state = campaign.new_state(HOLES, Config.template()["campaign"], 2, ["round"])
+    with pytest.raises(Exception, match="homing after round 1 failed"):
+        campaign.rehome_gripper(session, state, 1)
+
+
+def test_insert_args_pass_corner_in():
+    args = campaign._insert_args(SimpleNamespace(corner_in="on"), "rectangle_c0p2mm")
+    assert args.corner_in == "on"
+    assert campaign._insert_args(SimpleNamespace(), "rectangle_c0p2mm").corner_in is None

@@ -620,6 +620,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--search", choices=["grid", "belief"], default=None,
                    help="how later attempts are aimed: grid (default, insert.search): a probability grid of the hole "
                         "from every attempt's log, lines planned on it; belief: the last hold or dip")
+    p.add_argument("--corner-in", choices=insert.CORNER_IN_MODES, default=None,
+                   help="tight holes (<= insert.corner_in_max_clearance_mm): start the leading corner (the "
+                        "hexagon's edge) inside the hole's near rim, not on the board. auto (default, "
+                        "insert.corner_in): the shapes of insert.corner_in_shapes once 2 holes of this board pose are "
+                        "found; on: also rectangle, L-shape and hexagon, found holes or not; off: never")
     p.add_argument("--dry-run", action="store_true",
                    help="validate the probe target and peg_search's options; no motion, no robot connection")
     p.set_defaults(func=cmd_insert)
@@ -657,6 +662,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--max-inserts", type=int, default=None, metavar="N", help="stop after N inserts")
     c.add_argument("--no-board-correction", action="store_true",
                    help="every insert aims at the vision hole (insert --no-board-correction)")
+    c.add_argument("--corner-in", choices=insert.CORNER_IN_MODES, default=None,
+                   help="every insert's --corner-in (default insert.corner_in)")
     c.add_argument("--dry-run", action="store_true", help="list the inserts left; no motion")
     csub.add_parser("status", help="where the pegs are, and the results so far")
     c = csub.add_parser("peg", help="tell the campaign where a peg is (after moving it by hand, or a stop)")
